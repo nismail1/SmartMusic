@@ -1,0 +1,61 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function playlistOwner(playlistId) {
+      return get(/databases/$(database)/documents/playlists/$(playlistId)).data.userId;
+    }
+
+    // Users can read/write only their own profile docs.
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // Users can read/create their own playlists.
+    // Updates/deletes are restricted to the playlist owner.
+    match /playlists/{playlistId} {
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      // Only playlist owner can manage tracks for that playlist.
+      match /tracks/{trackId} {
+        allow read, write: if isSignedIn() && playlistOwner(playlistId) == request.auth.uid;
+      }
+    }
+
+    // Optional aggregate cache per playlist; only owner can read/write.
+    match /playlist_stats/{playlistId} {
+      allow read, write: if isSignedIn() && playlistOwner(playlistId) == request.auth.uid;
+    }
+
+    // Recommendations cache keyed by playlist; only owner can read/write.
+    match /recommendations_cache/{playlistId} {
+      allow read, write: if isSignedIn() && playlistOwner(playlistId) == request.auth.uid;
+    }
+
+    // Recommendation aggregate collections are read-only to signed-in users.
+    // They are populated by trusted backend scripts/functions.
+    match /song_stats/{songId} {
+      allow read: if isSignedIn();
+    }
+
+    match /songs/{songId} {
+      allow read: if isSignedIn();
+    }
+
+    match /cooccurrence_playlist/{trackId} {
+      allow read: if isSignedIn();
+    }
+
+    match /cooccurrence_search/{trackId} {
+      allow read: if isSignedIn();
+    }
+  }
+}

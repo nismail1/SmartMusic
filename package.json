@@ -1,0 +1,52 @@
+{
+  "name": "smartmusic",
+  "version": "1.0.0",
+  "description": "SmartMusic web app",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "seed:fetch-spotify": "node --loader ts-node/esm scripts/spotify/fetchSpotifyCatalog.ts",
+    "seed:generate": "node --loader ts-node/esm scripts/seedSyntheticData.ts",
+    "seed:build-aggregates": "node --loader ts-node/esm scripts/buildCooccurrence.ts",
+    "seed:verify": "node --loader ts-node/esm scripts/verifySeedData.ts",
+    "seed:firestore": "node --loader ts-node/esm scripts/seedToFirestore.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nismail1/SmartMusic.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/nismail1/SmartMusic/issues"
+  },
+  "homepage": "https://github.com/nismail1/SmartMusic#readme",
+  "dependencies": {
+    "firebase": "^10.8.1",
+    "firebase-admin": "^12.7.0",
+    "node-fetch": "^3.3.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.30.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^14.3.1",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/node": "^25.6.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "dotenv": "^17.4.2",
+    "jsdom": "^22.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4",
+    "vite": "^4.5.5",
+    "vitest": "^0.34.6"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "market": "US",
+  "latestCatalog": "catalog-us-v1.json",
+  "runs": [
+    {
+      "timestamp": "2026-04-25T17:24:18.112Z",
+      "hash": "ace4a01bf76d2f86310221f2799860bdaf507722354e444e537a904454f44724",
+      "trackCount": 306,
+      "rawFile": "raw-1777137858112.json",
+      "catalogVersion": "catalog-us-v1"
+    }
+  ]
+}

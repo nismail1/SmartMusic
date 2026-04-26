@@ -1,0 +1,8 @@
+{
+  "catalogVersion": "catalog-us-v1",
+  "market": "US",
+  "seedRandom": 424242,
+  "userCount": 200,
+  "eventCount": 3000,
+  "playlistCount": 400
+}

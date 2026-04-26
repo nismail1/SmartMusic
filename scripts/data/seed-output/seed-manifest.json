@@ -1,0 +1,11 @@
+{
+  "generatedAt": "2026-04-25T17:24:28.069Z",
+  "catalogVersion": "catalog-us-v1",
+  "rngSeed": 424242,
+  "counts": {
+    "songs": 306,
+    "users": 200,
+    "playlists": 400,
+    "events": 3000
+  }
+}
