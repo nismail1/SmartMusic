@@ -97,6 +97,7 @@ Primary collections used in current implementation include:
 Implemented endpoints in `functions/index.js`:
 
 - `getRecommendations`
+- `getSpotifyTracksByIds` — server-side Spotify catalog lookup for track metadata (expects `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` on the Functions runtime, not in the browser).
 - `getGeniusEnrichment`
 - `createSpotifyFirebaseSession`
 - `getSuggestionReason`

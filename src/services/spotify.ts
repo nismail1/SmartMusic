@@ -3,6 +3,21 @@ import type { SpotifyTrack } from "../types/music";
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search";
 const SPOTIFY_TRACKS_URL = "https://api.spotify.com/v1/tracks";
+
+/** Client-credentials tokens have no user market; Spotify requires `market` or requests may return 403. */
+function spotifyCatalogMarket(): string {
+  const raw = (import.meta.env.VITE_SPOTIFY_MARKET ?? "US").trim();
+  return /^[A-Za-z]{2}$/.test(raw) ? raw.toUpperCase() : "US";
+}
+
+/** Prefer Cloud Function proxy so Spotify secrets stay server-side (browser direct /v1/tracks often returns 403). */
+function resolveSpotifyTracksProxyUrl(): string {
+  const explicit = (import.meta.env.VITE_SPOTIFY_TRACKS_PROXY_URL ?? "").trim();
+  if (explicit) return explicit;
+  const rec = (import.meta.env.VITE_RECOMMENDATIONS_ENDPOINT ?? "").trim();
+  if (rec.includes("getRecommendations")) return rec.replace("getRecommendations", "getSpotifyTracksByIds");
+  return "";
+}
 const SPOTIFY_ARTISTS_URL = "https://api.spotify.com/v1/artists";
 const SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/playlists";
 
@@ -341,7 +356,11 @@ export const spotifyService = {
       { trackId },
       "H5"
     );
-    const trackRes = await fetchWithSpotifyRetry(`${SPOTIFY_TRACKS_URL}/${encodeURIComponent(trackId)}`, token);
+    const market = spotifyCatalogMarket();
+    const trackRes = await fetchWithSpotifyRetry(
+      `${SPOTIFY_TRACKS_URL}/${encodeURIComponent(trackId)}?${new URLSearchParams({ market }).toString()}`,
+      token
+    );
     if (!trackRes.ok) {
       if (trackRes.status === 429) {
         const retryAfterHeader = trackRes.headers.get("retry-after");
@@ -768,9 +787,67 @@ export const spotifyService = {
   async getTracksByIds(trackIds: string[]): Promise<SpotifyTrack[]> {
     const uniqueIds = Array.from(new Set(trackIds.map((id) => id.trim()).filter(Boolean)));
     if (!uniqueIds.length) return [];
+    const proxyUrl = resolveSpotifyTracksProxyUrl();
+    if (proxyUrl) {
+      const market = spotifyCatalogMarket();
+      let proxyHost = "";
+      try {
+        proxyHost = new URL(proxyUrl).host;
+      } catch {
+        proxyHost = "(invalid URL)";
+      }
+      debugLog(
+        "src/services/spotify.ts:getTracksByIds",
+        "track lookup via server proxy",
+        { requestedCount: uniqueIds.length, proxyHost },
+        "H-proxy"
+      );
+      const all: SpotifyTrack[] = [];
+      for (let i = 0; i < uniqueIds.length; i += 50) {
+        const batch = uniqueIds.slice(i, i + 50);
+        try {
+          const response = await fetch(proxyUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ids: batch, market })
+          });
+          if (!response.ok) {
+            let preview = "";
+            try {
+              preview = (await response.text()).slice(0, 200);
+            } catch {}
+            debugLog(
+              "src/services/spotify.ts:getTracksByIds",
+              "proxy track batch failed",
+              { status: response.status, preview },
+              "H-proxy"
+            );
+            continue;
+          }
+          const payload = (await response.json()) as { tracks?: SpotifyTrack[] };
+          const tracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+          all.push(...tracks.filter((t): t is SpotifyTrack => Boolean(t?.id)));
+        } catch (err) {
+          debugLog(
+            "src/services/spotify.ts:getTracksByIds",
+            "proxy track batch threw",
+            { message: err instanceof Error ? err.message : String(err) },
+            "H-proxy"
+          );
+        }
+      }
+      debugLog(
+        "src/services/spotify.ts:getTracksByIds",
+        "track lookup via proxy finished",
+        { requestedCount: uniqueIds.length, returnedCount: all.length },
+        "H-proxy"
+      );
+      return all;
+    }
+
     debugLog(
       "src/services/spotify.ts:getTracksByIds",
-      "track lookup started",
+      "track lookup started (browser client-credentials; prefer VITE_RECOMMENDATIONS_ENDPOINT for proxy)",
       { requestedCount: uniqueIds.length, sampleIds: uniqueIds.slice(0, 3) },
       "H7"
     );
@@ -787,33 +864,40 @@ export const spotifyService = {
       return [];
     }
     const token = await getToken();
-    const batches: string[][] = [];
-    for (let i = 0; i < uniqueIds.length; i += 50) {
-      batches.push(uniqueIds.slice(i, i + 50));
-    }
     const all: SpotifyTrack[] = [];
-    for (const batch of batches) {
-      const params = new URLSearchParams({ ids: batch.join(",") });
-      const response = await fetchWithSpotifyRetry(`${SPOTIFY_TRACKS_URL}?${params.toString()}`, token);
-      if (response.status === 429) {
-        setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
-      }
-      if (!response.ok) {
-        let bodyPreview = "";
-        try {
-          bodyPreview = (await response.text()).slice(0, 200);
-        } catch {}
-        debugLog(
-          "src/services/spotify.ts:getTracksByIds",
-          "track lookup batch failed",
-          { status: response.status, batchSize: batch.length, bodyPreview },
-          "H7"
-        );
-        continue;
-      }
-      const payload: any = await response.json();
-      const tracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
-      all.push(...tracks.filter(Boolean).map(normalizeTrack));
+    const market = spotifyCatalogMarket();
+    /** Batch GET /v1/tracks?ids= often returns 403 with client-credentials; per-track GET matches server/proxy behavior. */
+    const chunkSize = 10;
+    for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+      const chunk = uniqueIds.slice(i, i + chunkSize);
+      const chunkRows = await Promise.all(
+        chunk.map(async (trackId) => {
+          const params = new URLSearchParams({ market });
+          const response = await fetchWithSpotifyRetry(
+            `${SPOTIFY_TRACKS_URL}/${encodeURIComponent(trackId)}?${params.toString()}`,
+            token
+          );
+          if (response.status === 429) {
+            setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+          }
+          if (!response.ok) {
+            let bodyPreview = "";
+            try {
+              bodyPreview = (await response.text()).slice(0, 200);
+            } catch {}
+            debugLog(
+              "src/services/spotify.ts:getTracksByIds",
+              "track lookup single failed",
+              { status: response.status, trackId, bodyPreview },
+              "H7"
+            );
+            return null;
+          }
+          const item: unknown = await response.json();
+          return normalizeTrack(item as Parameters<typeof normalizeTrack>[0]);
+        })
+      );
+      all.push(...chunkRows.filter((t): t is SpotifyTrack => Boolean(t?.id)));
     }
     debugLog(
       "src/services/spotify.ts:getTracksByIds",

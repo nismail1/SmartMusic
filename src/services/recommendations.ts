@@ -412,7 +412,42 @@ async function hydrateApiRecommendationsFromSpotify(
   options?: RecommendationOptions
 ): Promise<RecommendationItem[]> {
   if (!fromApi.length) return [];
-  const playlistTrackIds = await loadPlaylistTrackIds(playlistId);
+  // #region agent log
+  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+    body: JSON.stringify({
+      sessionId: "658713",
+      runId: "suggestions-fail",
+      hypothesisId: "DBG-H0",
+      location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:entry",
+      message: "hydrate started",
+      data: { playlistId, fromApiCount: fromApi.length, firstSongId: fromApi[0]?.songId ?? null },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+  let playlistTrackIds: string[];
+  try {
+    playlistTrackIds = await loadPlaylistTrackIds(playlistId);
+  } catch (loadErr) {
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "suggestions-fail",
+        hypothesisId: "DBG-H-B",
+        location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:loadPlaylistTrackIds",
+        message: "loadPlaylistTrackIds threw",
+        data: { message: loadErr instanceof Error ? loadErr.message : String(loadErr) },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    throw loadErr;
+  }
   const { cacheKey, excludedHash } = buildSuggestionCacheKey(playlistId, playlistTrackIds, options?.excludeSongIds);
 
   if (!options?.forceRefresh) {
@@ -433,9 +468,64 @@ async function hydrateApiRecommendationsFromSpotify(
     }
   }
 
+  // #region agent log
+  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+    body: JSON.stringify({
+      sessionId: "658713",
+      runId: "post-fix-verify",
+      hypothesisId: "DBG-H-E",
+      location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:pastCacheRead",
+      message: "getCacheDoc branch completed without throw",
+      data: { cacheKey },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+
   const toHydrate = fromApi.slice(0, Math.max(RETURN_SUGGESTIONS, 5));
   const ids = toHydrate.map((i) => i.songId).filter(Boolean);
-  const tracks = await spotifyService.getTracksByIds(ids);
+  // #region agent log
+  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+    body: JSON.stringify({
+      sessionId: "658713",
+      runId: "suggestions-fail",
+      hypothesisId: "DBG-H-A-pre",
+      location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:beforeSpotify",
+      message: "about to call getTracksByIds",
+      data: {
+        idCount: ids.length,
+        hasViteSpotifyClientId: Boolean(import.meta.env.VITE_SPOTIFY_CLIENT_ID),
+        hasViteSpotifyClientSecret: Boolean(import.meta.env.VITE_SPOTIFY_CLIENT_SECRET)
+      },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+  let tracks;
+  try {
+    tracks = await spotifyService.getTracksByIds(ids);
+  } catch (spotifyErr) {
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "suggestions-fail",
+        hypothesisId: "DBG-H-A",
+        location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:getTracksByIds",
+        message: "getTracksByIds threw",
+        data: { message: spotifyErr instanceof Error ? spotifyErr.message : String(spotifyErr) },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    throw spotifyErr;
+  }
   const byId = new Map(tracks.map((t) => [t.id, t]));
   const merged = toHydrate.map((item) => {
     const t = byId.get(item.songId);
@@ -443,16 +533,35 @@ async function hydrateApiRecommendationsFromSpotify(
   });
   const out = merged.slice(0, RETURN_SUGGESTIONS);
 
-  await setCacheDoc("playlist_suggestion_cache", cacheKey, {
-    playlistId,
-    playlistTrackHash: playlistTrackHash(playlistTrackIds),
-    excludedHash,
-    suggestionSource: "api",
-    suggestions: merged,
-    primarySuggestion: out[0] ?? null,
-    fetchedAt: nowMs(),
-    expiresAt: nowMs() + TTL_MS.finalSuggestion
-  });
+  try {
+    await setCacheDoc("playlist_suggestion_cache", cacheKey, {
+      playlistId,
+      playlistTrackHash: playlistTrackHash(playlistTrackIds),
+      excludedHash,
+      suggestionSource: "api",
+      suggestions: merged,
+      primarySuggestion: out[0] ?? null,
+      fetchedAt: nowMs(),
+      expiresAt: nowMs() + TTL_MS.finalSuggestion
+    });
+  } catch (cacheWriteErr) {
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "suggestions-fail",
+        hypothesisId: "DBG-H-C",
+        location: "recommendations.ts:hydrateApiRecommendationsFromSpotify:setCacheDoc",
+        message: "setCacheDoc playlist_suggestion_cache threw",
+        data: { message: cacheWriteErr instanceof Error ? cacheWriteErr.message : String(cacheWriteErr) },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    throw cacheWriteErr;
+  }
   debugLog(
     "src/services/recommendations.ts:hydrateApiRecommendationsFromSpotify",
     "merged Spotify metadata into API items and cached",

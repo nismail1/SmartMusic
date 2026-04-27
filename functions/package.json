@@ -6,9 +6,9 @@
     "node": "20"
   },
   "scripts": {
-    "serve": "firebase emulators:start --only functions",
-    "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "serve": "npx firebase-tools@latest emulators:start --only functions",
+    "deploy": "npx firebase-tools@latest deploy --only functions",
+    "logs": "npx firebase-tools@latest functions:log"
   },
   "dependencies": {
     "firebase-admin": "^13.5.0",

@@ -57,5 +57,29 @@ service cloud.firestore {
     match /cooccurrence_search/{trackId} {
       allow read: if isSignedIn();
     }
+
+    // Client-side playlist suggestion cache (API hydrate + co-occurrence). Docs store playlistId for ownership.
+    match /playlist_suggestion_cache/{docId} {
+      allow read: if isSignedIn() && (
+        resource == null ||
+        (
+          resource.data.playlistId is string &&
+          exists(/databases/$(database)/documents/playlists/$(resource.data.playlistId)) &&
+          get(/databases/$(database)/documents/playlists/$(resource.data.playlistId)).data.userId == request.auth.uid
+        )
+      );
+      allow create: if isSignedIn() &&
+        request.resource.data.playlistId is string &&
+        exists(/databases/$(database)/documents/playlists/$(request.resource.data.playlistId)) &&
+        get(/databases/$(database)/documents/playlists/$(request.resource.data.playlistId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() &&
+        resource.data.playlistId == request.resource.data.playlistId &&
+        exists(/databases/$(database)/documents/playlists/$(resource.data.playlistId)) &&
+        get(/databases/$(database)/documents/playlists/$(resource.data.playlistId)).data.userId == request.auth.uid;
+      allow delete: if isSignedIn() &&
+        resource.data.playlistId is string &&
+        exists(/databases/$(database)/documents/playlists/$(resource.data.playlistId)) &&
+        get(/databases/$(database)/documents/playlists/$(resource.data.playlistId)).data.userId == request.auth.uid;
+    }
   }
 }

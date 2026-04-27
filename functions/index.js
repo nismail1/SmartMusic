@@ -479,6 +479,98 @@ function parseJsonBody(req) {
   return null;
 }
 
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_TRACKS_BATCH_URL = "https://api.spotify.com/v1/tracks";
+
+async function fetchSpotifyServerAccessToken() {
+  const clientId = process.env.SPOTIFY_CLIENT_ID || "";
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || "";
+  if (!clientId || !clientSecret) {
+    throw new Error("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET on the Functions runtime (not VITE_).");
+  }
+  const res = await fetch(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
+    },
+    body: new URLSearchParams({ grant_type: "client_credentials" }).toString()
+  });
+  if (!res.ok) {
+    const preview = (await res.text()).slice(0, 200);
+    logger.warn("fetchSpotifyServerAccessToken failed", { status: res.status, preview });
+    throw new Error("Spotify token request failed");
+  }
+  const json = await res.json();
+  return json.access_token;
+}
+
+function normalizeSpotifyTrackForClient(item) {
+  if (!item || !item.id) return null;
+  return {
+    id: item.id,
+    name: item.name,
+    artists: Array.isArray(item.artists) ? item.artists.map((a) => a.name) : [],
+    uri: item.uri ?? "",
+    albumId: item.album?.id ?? "",
+    albumName: item.album?.name ?? "",
+    artworkUrl: item.album?.images?.[0]?.url ?? null,
+    previewUrl: item.preview_url ?? null,
+    releaseDate: item.album?.release_date ?? null,
+    durationMs: item.duration_ms ?? 0
+  };
+}
+
+/** Server-side catalog lookup so the browser never sends Spotify client-credentials requests (avoids 403 / secret exposure). */
+exports.getSpotifyTracksByIds = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const body = parseJsonBody(req) || req.body || {};
+    const idsRaw = body.ids;
+    const ids = Array.isArray(idsRaw) ? idsRaw.map((id) => String(id).trim()).filter(Boolean) : [];
+    if (!ids.length) {
+      res.status(400).json({ error: "ids array is required" });
+      return;
+    }
+    let market = String(body.market || "US").trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(market)) market = "US";
+    const unique = [...new Set(ids)].slice(0, 100);
+
+    const token = await fetchSpotifyServerAccessToken();
+    const out = [];
+    /** Spotify often returns 403 on GET /v1/tracks?ids=… (batch) for client-credentials; per-id GET /v1/tracks/{id} returns 200. */
+    const chunkSize = 10;
+    for (let i = 0; i < unique.length; i += chunkSize) {
+      const chunk = unique.slice(i, i + chunkSize);
+      const chunkResults = await Promise.all(
+        chunk.map(async (trackId) => {
+          const params = new URLSearchParams({ market });
+          const spotifyRes = await fetch(`${SPOTIFY_TRACKS_BATCH_URL}/${encodeURIComponent(trackId)}?${params.toString()}`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+          });
+          if (!spotifyRes.ok) {
+            const preview = (await spotifyRes.text()).slice(0, 200);
+            logger.warn("getSpotifyTracksByIds single-track HTTP error", { trackId, status: spotifyRes.status, preview });
+            return null;
+          }
+          const item = await spotifyRes.json();
+          return normalizeSpotifyTrackForClient(item);
+        })
+      );
+      for (const row of chunkResults) {
+        if (row) out.push(row);
+      }
+    }
+    res.status(200).json({ tracks: out });
+  } catch (error) {
+    logger.error("getSpotifyTracksByIds failed", error);
+    res.status(500).json({ error: "Internal error", detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 const appspotSa = getAppspotServiceAccount();
 const createSpotifyAuthOptions = {
   cors: true,
