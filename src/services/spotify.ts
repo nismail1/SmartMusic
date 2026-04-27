@@ -119,16 +119,6 @@ async function fetchWithSpotifyRetry(url: string, token: string, init?: RequestI
   throw new Error("Spotify request exhausted retries.");
 }
 
-function getSpotifyCooldownKey(url: string): string {
-  if (url.includes("/v1/search")) return "search";
-  if (url.includes("/v1/tracks")) return "tracks";
-  if (url.includes("/v1/artists")) return "artists";
-  if (url.includes("/v1/me/playlists")) return "me_playlists";
-  if (url.includes("/v1/playlists")) return "playlists";
-  if (url.includes("/v1/me")) return "me";
-  return "spotify_generic";
-}
-
 function getCooldownRemainingMs(key: string): number {
   const until = spotifyCooldowns.get(key) ?? 0;
   const now = Date.now();
