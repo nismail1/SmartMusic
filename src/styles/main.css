@@ -558,9 +558,85 @@ a.btn-primary:hover,
   color: var(--color-muted);
 }
 
+.suggestion-spotlight {
+  border: 2px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-surface-2) 55%, var(--color-surface));
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: 1px 1px 0 var(--color-border);
+}
+
+.suggestion-spotlight__kicker {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+
+.suggestion-spotlight__title {
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+
+.suggestion-spotlight__meta {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+  color: var(--color-muted);
+}
+
+.suggestion-spotlight__reason {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  color: var(--color-text);
+  font-weight: 600;
+}
+
 .error {
   color: #7a1f1a;
   font-size: 0.9rem;
+}
+
+.icon-minus-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--color-muted);
+  border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  background: color-mix(in srgb, var(--color-surface-2) 30%, transparent);
+}
+
+.icon-minus-button:hover {
+  color: var(--color-text);
+  border-color: var(--color-border);
+  background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
+}
+
+.icon-minus-button--danger:hover {
+  color: #7a1f1a;
+  border-color: color-mix(in srgb, #7a1f1a 45%, var(--color-border));
+}
+
+.ghost-button {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--color-border) 80%, transparent);
+  color: var(--color-muted);
+}
+
+.ghost-button:hover {
+  color: var(--color-text);
+  border-style: solid;
 }
 
 /* Song drawer */

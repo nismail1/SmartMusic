@@ -48,8 +48,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       authService.setSpotifySession(nextSession);
       setSpotifySession(nextSession);
     } catch {
-      authService.setSpotifySession(null);
-      setSpotifySession(null);
+      // Keep the last known session on transient Spotify API failures so Spotify UI
+      // (import/playback flows) does not disappear mid-session.
+      setSpotifySession(existing);
     }
   }
 

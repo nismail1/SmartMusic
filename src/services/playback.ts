@@ -148,6 +148,24 @@ class PlaybackController {
       }
       return;
     }
+    if (!options.preferSpotify && !options.spotifyAccessToken && !track.previewUrl && track.uri) {
+      this.setState({
+        mode: "preview",
+        isPlaying: false,
+        currentTrack: track,
+        isPremiumCapable: null,
+        error:
+          "No preview is available for this track. Continue with Spotify to connect your Premium account for full-song playback."
+      });
+      debugLog(
+        "src/services/playback.ts:play",
+        "track requires spotify session for full playback",
+        { trackId: track.id, hasPreviewUrl: false, hasTrackUri: true },
+        "H23",
+        "metadata-playback-debug"
+      );
+      return;
+    }
     await this.playPreview(track);
   }
 

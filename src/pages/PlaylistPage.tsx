@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { SongDetailsDrawer } from "../components/SongDetailsDrawer";
 import { useAuth } from "../context/AuthContext";
 import { geniusService } from "../services/genius";
@@ -7,13 +7,13 @@ import { computePlaylistAnalytics } from "../services/playlistAnalytics";
 import { playbackController } from "../services/playback";
 import { playlistService } from "../services/playlists";
 import { recommendationService } from "../services/recommendations";
-import { spotifyService } from "../services/spotify";
 import type { GeniusEnrichment, PlaylistTrack, RecommendationItem, SpotifyTrack } from "../types/music";
 import { formatDuration } from "../lib/format";
 
 type SortKey = "addedAt" | "artist" | "releaseDate" | "durationMs";
 
 export function PlaylistPage() {
+  const navigate = useNavigate();
   const { playlistId = "" } = useParams();
   const { authMode, spotifySession } = useAuth();
   const [playlistName, setPlaylistName] = useState("Playlist View");
@@ -27,15 +27,66 @@ export function PlaylistPage() {
   const [drawerLoading, setDrawerLoading] = useState(false);
   const [drawerError, setDrawerError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [deletingPlaylist, setDeletingPlaylist] = useState(false);
+  const [mutatingTrackId, setMutatingTrackId] = useState<string | null>(null);
   const [suggestionStatus, setSuggestionStatus] = useState("");
   const [sortBy, setSortBy] = useState<SortKey>("addedAt");
   const [activeGenreFilter, setActiveGenreFilter] = useState<string>("all");
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const [suppressedSuggestionIds, setSuppressedSuggestionIds] = useState<string[]>([]);
+  const [addedFromSuggestions, setAddedFromSuggestions] = useState<string[]>([]);
+
+  const suppressionStorageKey = useMemo(() => `smartmusic:suppressedSuggestions:${playlistId}`, [playlistId]);
+  const addedFromSuggestionStorageKey = useMemo(() => `smartmusic:addedFromSuggestions:${playlistId}`, [playlistId]);
 
   useEffect(() => {
     setHasLoadedOnce(false);
     setPlaylistName("Playlist View");
   }, [playlistId]);
+
+  useEffect(() => {
+    if (!playlistId) return;
+    try {
+      const suppressed = JSON.parse(window.localStorage.getItem(suppressionStorageKey) ?? "[]");
+      setSuppressedSuggestionIds(Array.isArray(suppressed) ? suppressed.filter((id) => typeof id === "string") : []);
+      const added = JSON.parse(window.localStorage.getItem(addedFromSuggestionStorageKey) ?? "[]");
+      setAddedFromSuggestions(Array.isArray(added) ? added.filter((id) => typeof id === "string") : []);
+    } catch {
+      setSuppressedSuggestionIds([]);
+      setAddedFromSuggestions([]);
+    }
+  }, [playlistId, suppressionStorageKey, addedFromSuggestionStorageKey]);
+
+  useEffect(() => {
+    if (!recommendations.length) return;
+    const missingReleaseCount = recommendations.filter((item) => !item.releaseDate).length;
+    const missingDurationCount = recommendations.filter((item) => !Number(item.durationMs ?? 0)).length;
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "metadata-playback-debug",
+        hypothesisId: "H21",
+        location: "src/pages/PlaylistPage.tsx:useEffect(recommendations)",
+        message: "recommendations set for display",
+        data: {
+          count: recommendations.length,
+          missingReleaseCount,
+          missingDurationCount,
+          first: {
+            songId: recommendations[0]?.songId ?? null,
+            releaseDate: recommendations[0]?.releaseDate ?? null,
+            durationMs: recommendations[0]?.durationMs ?? null,
+            previewUrl: recommendations[0]?.previewUrl ?? null
+          }
+        },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+  }, [recommendations]);
 
   useEffect(() => {
     async function load() {
@@ -48,14 +99,6 @@ export function PlaylistPage() {
         setPlaylistName(playlist?.name || "Playlist View");
         const baseTracks = await playlistService.listPlaylistTracks(playlistId);
         setTracks(baseTracks);
-        void Promise.all(
-          baseTracks.map(async (track) => ({
-            ...track,
-            genius: track.genius ?? (await geniusService.enrichTrack(track))
-          }))
-        ).then((withGenius) => {
-          setTracks(withGenius);
-        });
       } catch {
         setTracks([]);
         setRecommendations([]);
@@ -65,7 +108,7 @@ export function PlaylistPage() {
       }
 
       try {
-        setRecommendations(await recommendationService.getRecommendations(playlistId));
+        setRecommendations(await recommendationService.getRecommendations(playlistId, { excludeSongIds: suppressedSuggestionIds }));
       } catch {
         setRecommendations([]);
         setRecommendationError("Unable to load suggestions right now. Please try again in a moment.");
@@ -75,7 +118,49 @@ export function PlaylistPage() {
       }
     }
     void load();
-  }, [playlistId, hasLoadedOnce]);
+  }, [playlistId, hasLoadedOnce, suppressedSuggestionIds]);
+
+  async function refreshSuggestions() {
+    if (!playlistId) return;
+    try {
+      setRecommendations(await recommendationService.getRecommendations(playlistId, { excludeSongIds: suppressedSuggestionIds }));
+      setRecommendationError("");
+    } catch (error) {
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "suppression-debug",
+          hypothesisId: "H14",
+          location: "src/pages/PlaylistPage.tsx:refreshSuggestions",
+          message: "refresh suggestions failed",
+          data: { playlistId, suppressedCount: suppressedSuggestionIds.length, message: error instanceof Error ? error.message : String(error) },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      setRecommendations([]);
+      setRecommendationError("Unable to load suggestions right now. Please try again in a moment.");
+    }
+  }
+
+  function persistSuppressedIds(updater: (previous: string[]) => string[]) {
+    setSuppressedSuggestionIds((previous) => {
+      const next = updater(previous);
+      window.localStorage.setItem(suppressionStorageKey, JSON.stringify(next));
+      return next;
+    });
+  }
+
+  function persistAddedFromSuggestions(updater: (previous: string[]) => string[]) {
+    setAddedFromSuggestions((previous) => {
+      const next = updater(previous);
+      window.localStorage.setItem(addedFromSuggestionStorageKey, JSON.stringify(next));
+      return next;
+    });
+  }
 
   async function openSongDetails(track: PlaylistTrack, queue: PlaylistTrack[] = [], queueIndex = -1) {
     setSelectedTrack(track);
@@ -87,6 +172,16 @@ export function PlaylistPage() {
     try {
       const details = await geniusService.enrichTrack(track);
       setDrawerDetails(details);
+      setTracks((prev) =>
+        prev.map((item) =>
+          item.id === track.id
+            ? {
+                ...item,
+                genius: details
+              }
+            : item
+        )
+      );
     } catch {
       setDrawerDetails(track.genius ?? null);
       setDrawerError("Unable to load Genius details for this song.");
@@ -118,24 +213,83 @@ export function PlaylistPage() {
   async function handleSuggestionAdd(item: RecommendationItem) {
     if (!playlistId) return;
     try {
-      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
-      const trackToAdd: SpotifyTrack = fullTrack ?? {
+      const trackToAdd: SpotifyTrack = {
         id: item.songId,
         name: item.songName ?? item.songId,
         artists: item.artists ?? [],
-        uri: `spotify:track:${item.songId}`,
+        uri: item.uri ?? `spotify:track:${item.songId}`,
         albumId: "",
-        albumName: "",
+        albumName: item.albumName ?? "",
         artworkUrl: item.artworkUrl ?? null,
         previewUrl: item.previewUrl ?? null,
-        releaseDate: null,
-        durationMs: 0
+        releaseDate: item.releaseDate ?? null,
+        durationMs: Number(item.durationMs ?? 0),
+        genres: []
       };
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "metadata-genre-debug",
+          hypothesisId: "H30",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionAdd",
+          message: "suggestion converted to playlist track",
+          data: {
+            playlistId,
+            songId: item.songId,
+            resolvedByLookup: false,
+            releaseDate: trackToAdd.releaseDate ?? null,
+            albumName: trackToAdd.albumName ?? "",
+            genreCount: Array.isArray(trackToAdd.genres) ? trackToAdd.genres.length : 0
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
       await playlistService.addTrack(playlistId, trackToAdd);
       setSuggestionStatus(`Added ${trackToAdd.name} to this playlist.`);
       setTracks((prev) => [...prev, { ...trackToAdd, addedAt: new Date().toISOString() }]);
+      persistAddedFromSuggestions((previous) => Array.from(new Set([...previous, trackToAdd.id])));
+      await refreshSuggestions();
     } catch {
       setSuggestionStatus("Could not add this suggestion right now.");
+    }
+  }
+
+  async function handleRemoveTrack(trackId: string, trackName: string) {
+    if (!playlistId) return;
+    setMutatingTrackId(trackId);
+    try {
+      await playlistService.removeTrack(playlistId, trackId);
+      setTracks((prev) => prev.filter((track) => track.id !== trackId));
+      setSuggestionStatus(`Removed ${trackName} from this playlist.`);
+      if (addedFromSuggestions.includes(trackId)) {
+        persistSuppressedIds((previous) => Array.from(new Set([...previous, trackId])));
+        persistAddedFromSuggestions((previous) => previous.filter((id) => id !== trackId));
+      }
+      await refreshSuggestions();
+    } catch {
+      setSuggestionStatus("Could not remove this song right now.");
+    } finally {
+      setMutatingTrackId(null);
+    }
+  }
+
+  async function handleDeletePlaylist() {
+    if (!playlistId) return;
+    const confirmDelete = window.confirm(
+      "Delete this SmartMusic playlist and all its songs from the app? This will not affect your Spotify account."
+    );
+    if (!confirmDelete) return;
+    setDeletingPlaylist(true);
+    try {
+      await playlistService.deletePlaylist(playlistId);
+      navigate("/home");
+    } catch {
+      setSuggestionStatus("Could not delete this playlist right now.");
+      setDeletingPlaylist(false);
     }
   }
 
@@ -161,32 +315,7 @@ export function PlaylistPage() {
         })
       }).catch(() => {});
       // #endregion
-      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
-      // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
-        body: JSON.stringify({
-          sessionId: "658713",
-          runId: "suggestion-play-debug",
-          hypothesisId: "H5",
-          location: "src/pages/PlaylistPage.tsx:handleSuggestionPlay",
-          message: "spotify track lookup result",
-          data: fullTrack
-            ? {
-                found: true,
-                trackId: fullTrack.id,
-                releaseDate: fullTrack.releaseDate ?? null,
-                durationMs: fullTrack.durationMs ?? null,
-                previewUrl: fullTrack.previewUrl ?? null,
-                uri: fullTrack.uri ?? null
-              }
-            : { found: false, requestedId: item.songId },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
-      const track: SpotifyTrack = fullTrack ?? {
+      const track: SpotifyTrack = {
         id: item.songId,
         name: item.songName ?? item.songId,
         artists: item.artists ?? [],
@@ -218,6 +347,29 @@ export function PlaylistPage() {
           .filter((recTrack) => Boolean(recTrack.id)),
         index: recommendations.findIndex((rec) => rec.songId === item.songId)
       });
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "metadata-playback-debug",
+          hypothesisId: "H22",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionPlay",
+          message: "suggestion playback dispatched",
+          data: {
+            songId: track.id,
+            authMode,
+            hasSpotifySession: Boolean(spotifySession),
+            hasSpotifyToken: Boolean(spotifySession?.accessToken),
+            spotifyScope: spotifySession?.scope ?? null,
+            hasPreviewUrl: Boolean(track.previewUrl),
+            releaseDate: track.releaseDate ?? null
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
     } catch {
       // #region agent log
       fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
@@ -240,23 +392,20 @@ export function PlaylistPage() {
 
   async function handleSuggestionClick(item: RecommendationItem) {
     try {
-      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
-      const track: PlaylistTrack = fullTrack
-        ? { ...fullTrack, addedAt: new Date().toISOString() }
-        : {
-            id: item.songId,
-            name: item.songName ?? item.songId,
-            artists: item.artists ?? [],
-            uri: item.uri ?? `spotify:track:${item.songId}`,
-            albumId: "",
-            albumName: item.albumName ?? "",
-            artworkUrl: item.artworkUrl ?? null,
-            previewUrl: item.previewUrl ?? null,
-            releaseDate: item.releaseDate ?? null,
-            durationMs: Number(item.durationMs ?? 0),
-            genres: [],
-            addedAt: new Date().toISOString()
-          };
+      const track: PlaylistTrack = {
+        id: item.songId,
+        name: item.songName ?? item.songId,
+        artists: item.artists ?? [],
+        uri: item.uri ?? `spotify:track:${item.songId}`,
+        albumId: "",
+        albumName: item.albumName ?? "",
+        artworkUrl: item.artworkUrl ?? null,
+        previewUrl: item.previewUrl ?? null,
+        releaseDate: item.releaseDate ?? null,
+        durationMs: Number(item.durationMs ?? 0),
+        genres: [],
+        addedAt: new Date().toISOString()
+      };
       await openSongDetails(track);
     } catch {
       const fallbackTrack: PlaylistTrack = {
@@ -274,6 +423,56 @@ export function PlaylistPage() {
         addedAt: new Date().toISOString()
       };
       await openSongDetails(fallbackTrack);
+    }
+  }
+
+  async function handleSuggestionDismiss(item: RecommendationItem) {
+    if (!playlistId) return;
+    const dismissedId = item.songId;
+    const nextSuppressed = Array.from(new Set([...suppressedSuggestionIds, dismissedId]));
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "suppression-debug",
+        hypothesisId: "H11",
+        location: "src/pages/PlaylistPage.tsx:handleSuggestionDismiss",
+        message: "dismiss suggestion requested",
+        data: { playlistId, dismissedId, previousSuppressedCount: suppressedSuggestionIds.length, nextSuppressedCount: nextSuppressed.length },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    persistSuppressedIds(() => nextSuppressed);
+    setSuggestionStatus(`Got it - we won't suggest ${item.songName ?? "that track"} again for this playlist.`);
+    try {
+      setRecommendations(
+        await recommendationService.getRecommendations(playlistId, {
+          excludeSongIds: nextSuppressed,
+          forceRefresh: true
+        })
+      );
+      setRecommendationError("");
+    } catch (error) {
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "suppression-debug",
+          hypothesisId: "H14",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionDismiss",
+          message: "dismiss flow failed to fetch next suggestion",
+          data: { playlistId, dismissedId, nextSuppressedCount: nextSuppressed.length, message: error instanceof Error ? error.message : String(error) },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      setRecommendations([]);
+      setRecommendationError("Unable to load suggestions right now. Please try again in a moment.");
     }
   }
 
@@ -343,6 +542,18 @@ export function PlaylistPage() {
       </div>
 
       <h3>Tracks</h3>
+      <div className="actions" style={{ margin: "0 0 10px" }}>
+        <button
+          type="button"
+          className="icon-minus-button icon-minus-button--danger"
+          onClick={() => void handleDeletePlaylist()}
+          disabled={deletingPlaylist}
+          aria-label={deletingPlaylist ? "Deleting playlist" : "Delete playlist from SmartMusic"}
+          title={deletingPlaylist ? "Deleting..." : "Delete playlist (SmartMusic only)"}
+        >
+          &minus;
+        </button>
+      </div>
       <div className="track-chart-wrap">
         <table className="track-chart">
           <thead>
@@ -351,6 +562,7 @@ export function PlaylistPage() {
               <th>Artist</th>
               <th>Album</th>
               <th>Duration</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -364,6 +576,18 @@ export function PlaylistPage() {
                 <td>{track.artists.join(", ")}</td>
                 <td>{track.albumName}</td>
                 <td>{formatDuration(track.durationMs)}</td>
+                <td>
+                  <button
+                    type="button"
+                    className="icon-minus-button"
+                    onClick={() => void handleRemoveTrack(track.id, track.name)}
+                    disabled={mutatingTrackId === track.id}
+                    aria-label={mutatingTrackId === track.id ? "Removing song" : `Remove ${track.name} from playlist`}
+                    title={mutatingTrackId === track.id ? "Removing..." : "Remove from playlist"}
+                  >
+                    &minus;
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -374,28 +598,32 @@ export function PlaylistPage() {
       {recommendationError ? <p className="error">{recommendationError}</p> : null}
       {suggestionStatus ? <p>{suggestionStatus}</p> : null}
       {!recommendationError && !recommendations.length ? <p style={{ color: "var(--color-muted)" }}>No suggestions yet.</p> : null}
-      <ul className="suggestions-list">
-        {recommendations.map((item) => (
-          <li key={item.songId}>
-            <button type="button" className="track-link-button" onClick={() => void handleSuggestionClick(item)}>
-              <strong>{item.songName ?? item.songId}</strong>
-              {item.artists?.length ? ` — ${item.artists.join(", ")}` : ""}
+      {recommendations[0] ? (
+        <section className="suggestion-spotlight" aria-label="Suggested next song">
+          <p className="suggestion-spotlight__kicker">Suggested Next Song</p>
+          <button type="button" className="track-link-button suggestion-spotlight__title" onClick={() => void handleSuggestionClick(recommendations[0])}>
+            <strong>{recommendations[0].songName ?? recommendations[0].songId}</strong>
+            {recommendations[0].artists?.length ? ` — ${recommendations[0].artists.join(", ")}` : ""}
+          </button>
+          <p className="suggestion-spotlight__meta">
+            {(recommendations[0].releaseDate ?? "Unknown release")} | {formatDuration(Number(recommendations[0].durationMs ?? 0))}
+          </p>
+          <p className="suggestion-spotlight__reason">
+            {recommendations[0].reasons?.[0] ?? "Picked to fit this playlist right now."}
+          </p>
+          <div className="actions" style={{ marginTop: 8 }}>
+            <button type="button" onClick={() => void handleSuggestionPlay(recommendations[0])}>
+              Play preview
             </button>
-            <div style={{ color: "var(--color-muted)", fontSize: "0.85rem" }}>
-              {(item.releaseDate ?? "Unknown release")} | {formatDuration(Number(item.durationMs ?? 0))}
-            </div>
-            <div>{item.reasons?.[0] ?? "Picked to fit this playlist right now."}</div>
-            <div className="actions" style={{ marginTop: 6 }}>
-              <button type="button" onClick={() => void handleSuggestionPlay(item)}>
-                Play preview
-              </button>
-              <button type="button" onClick={() => void handleSuggestionAdd(item)}>
-                Add to playlist
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
+            <button type="button" onClick={() => void handleSuggestionAdd(recommendations[0])}>
+              Add to playlist
+            </button>
+            <button type="button" className="ghost-button" onClick={() => void handleSuggestionDismiss(recommendations[0])}>
+              Nah, not for me
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       <SongDetailsDrawer
         track={selectedTrack}

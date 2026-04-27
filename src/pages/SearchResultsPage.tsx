@@ -8,8 +8,28 @@ import { useAuth } from "../context/AuthContext";
 import type { GeniusEnrichment, Playlist, SpotifyTrack } from "../types/music";
 import { formatDuration } from "../lib/format";
 
+function debugLog(location: string, message: string, data: Record<string, unknown>, hypothesisId: string, runId = "search-page-debug") {
+  // #region agent log
+  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+    body: JSON.stringify({
+      sessionId: "658713",
+      runId,
+      hypothesisId,
+      location,
+      message,
+      data,
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+}
+
+const searchPageInFlightKeys = new Set<string>();
+
 export function SearchResultsPage() {
-  const { user } = useAuth();
+  const { user, spotifySession } = useAuth();
   const [params, setParams] = useSearchParams();
   const initialQuery = params.get("query") ?? "";
   const [queryText, setQueryText] = useState(initialQuery);
@@ -33,13 +53,70 @@ export function SearchResultsPage() {
 
   useEffect(() => {
     if (!initialQuery.trim()) return;
+    const searchKey = `${initialQuery.trim().toLowerCase()}::${user?.uid ?? "anon"}`;
+    if (searchPageInFlightKeys.has(searchKey)) {
+      debugLog(
+        "src/pages/SearchResultsPage.tsx:useEffect",
+        "duplicate in-flight search skipped",
+        { initialQuery, searchKey },
+        "H45"
+      );
+      return;
+    }
+    searchPageInFlightKeys.add(searchKey);
+    debugLog(
+      "src/pages/SearchResultsPage.tsx:useEffect",
+      "search effect triggered",
+      { initialQuery, hasUser: Boolean(user?.uid) },
+      "H42"
+    );
     setLoading(true);
-    void spotifyService
-      .searchTracks(initialQuery)
-      .then(setResults)
-      .catch((err) => setStatus(err instanceof Error ? err.message : "Search failed"))
-      .finally(() => setLoading(false));
-  }, [initialQuery]);
+    void (async () => {
+      try {
+        const spotifyResults = await spotifyService.searchTracks(
+          initialQuery,
+          "US",
+          "search-page",
+          spotifySession?.accessToken
+        );
+        if (spotifyResults.length > 0) {
+          setResults(spotifyResults);
+          setStatus("");
+          return;
+        }
+        if (!user) {
+          setResults([]);
+          setStatus("Spotify is rate-limited right now. Try again in a moment.");
+          return;
+        }
+        const userPlaylists = await playlistService.listPlaylists(user.uid);
+        const importedMatches: SpotifyTrack[] = [];
+        const seen = new Set<string>();
+        const normalizedQuery = initialQuery.toLowerCase();
+        for (const playlist of userPlaylists) {
+          const tracks = await playlistService.listPlaylistTracks(playlist.id);
+          for (const track of tracks) {
+            if (seen.has(track.id)) continue;
+            const haystack = `${track.name} ${track.artists.join(" ")} ${track.albumName}`.toLowerCase();
+            if (!haystack.includes(normalizedQuery)) continue;
+            importedMatches.push(track);
+            seen.add(track.id);
+          }
+        }
+        setResults(importedMatches);
+        setStatus(
+          importedMatches.length
+            ? "Spotify is rate-limited, showing matches from your imported tracks."
+            : "Spotify is rate-limited right now. Try again in a moment."
+        );
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : "Search failed");
+      } finally {
+        searchPageInFlightKeys.delete(searchKey);
+        setLoading(false);
+      }
+    })();
+  }, [initialQuery, user, spotifySession?.accessToken]);
 
   async function runSearch(e: React.FormEvent) {
     e.preventDefault();

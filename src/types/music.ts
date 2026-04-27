@@ -10,6 +10,7 @@ export interface SpotifyTrack {
   releaseDate: string | null;
   durationMs: number;
   genres?: string[];
+  genresFetchedAt?: string | null;
 }
 
 export interface GeniusEnrichment {

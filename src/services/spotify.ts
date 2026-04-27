@@ -33,6 +33,12 @@ function debugLog(
 let cachedToken: { value: string; expiresAt: number } | null = null;
 const supplementalTagsCache = new Map<string, string[]>();
 const supplementalTagsInFlight = new Map<string, Promise<string[]>>();
+const searchTracksCache = new Map<string, { expiresAt: number; results: SpotifyTrack[] }>();
+const searchTracksInFlight = new Map<string, Promise<SpotifyTrack[]>>();
+let searchCooldownUntil = 0;
+let supplementalQueue = Promise.resolve<void>(undefined);
+let supplementalCooldownUntil = 0;
+const SEARCH_TRACKS_TTL_MS = 10 * 60 * 1000;
 
 async function getToken(): Promise<string> {
   const now = Date.now();
@@ -112,6 +118,22 @@ async function fetchWithSpotifyRetry(url: string, token: string, init?: RequestI
   throw new Error("Spotify request exhausted retries.");
 }
 
+function parseRetryAfterMs(retryAfterHeader: string | null): number {
+  if (!retryAfterHeader) return 1000;
+  const numeric = Number(retryAfterHeader);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    // Spotify should return seconds; some intermediaries return milliseconds.
+    // Treat very large values as milliseconds to avoid absurd wait times.
+    if (numeric > 3600) return Math.max(300, Math.floor(numeric));
+    return Math.max(300, Math.floor(numeric * 1000));
+  }
+  const parsedDateMs = Date.parse(retryAfterHeader);
+  if (Number.isFinite(parsedDateMs)) {
+    return Math.max(300, parsedDateMs - Date.now());
+  }
+  return 1000;
+}
+
 export interface SpotifyUserProfile {
   id: string;
   displayName: string;
@@ -140,50 +162,132 @@ function normalizeTag(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function buildHeuristicTrackTags(track: any): string[] {
-  const tags: string[] = [];
-  const popularity = Number(track?.popularity ?? 0);
-  const durationMs = Number(track?.duration_ms ?? 0);
-  const releaseDate = String(track?.album?.release_date ?? "");
-  const year = Number(releaseDate.slice(0, 4));
-
-  if (track?.explicit) tags.push("explicit");
-  if (popularity >= 75) tags.push("popularity high");
-  else if (popularity >= 40) tags.push("popularity medium");
-  else tags.push("popularity low");
-
-  if (durationMs >= 240_000) tags.push("duration long");
-  else if (durationMs >= 150_000) tags.push("duration medium");
-  else if (durationMs > 0) tags.push("duration short");
-
-  if (Number.isFinite(year) && year > 0) {
-    if (year >= 2020) tags.push("era 2020s");
-    else if (year >= 2010) tags.push("era 2010s");
-    else if (year >= 2000) tags.push("era 2000s");
-    else if (year >= 1990) tags.push("era 90s");
-  }
-
-  return tags;
-}
-
 export const spotifyService = {
-  async searchTracks(query: string, market = "US"): Promise<SpotifyTrack[]> {
-    if (!query.trim()) return [];
-    const token = await getToken();
+  async searchTracks(
+    query: string,
+    market = "US",
+    source = "unknown",
+    accessToken?: string
+  ): Promise<SpotifyTrack[]> {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) return [];
+    const cacheKey = `${market}:${normalizedQuery.toLowerCase()}`;
+    const now = Date.now();
+    if (searchCooldownUntil > now) {
+      const waitMs = searchCooldownUntil - now;
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "search-token-debug",
+          hypothesisId: "H48",
+          location: "src/services/spotify.ts:searchTracks",
+          message: "search request skipped due cooldown",
+          data: { query: normalizedQuery, source, waitMs },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      return [];
+    }
+    const cached = searchTracksCache.get(cacheKey);
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "search-rate-debug",
+        hypothesisId: "H41",
+        location: "src/services/spotify.ts:searchTracks",
+        message: "searchTracks invoked",
+        data: { query: normalizedQuery, market, source, hasFreshCache: Boolean(cached && cached.expiresAt > now) },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    if (cached && cached.expiresAt > now) {
+      return cached.results;
+    }
+    if (searchTracksInFlight.has(cacheKey)) {
+      return searchTracksInFlight.get(cacheKey) ?? [];
+    }
+    const task = (async () => {
+    const token = accessToken?.trim() ? accessToken.trim() : await getToken();
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "search-token-debug",
+        hypothesisId: "H46",
+        location: "src/services/spotify.ts:searchTracks",
+        message: "search token mode selected",
+        data: { query: normalizedQuery, source, tokenMode: accessToken?.trim() ? "user-access-token" : "client-credentials" },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
     const params = new URLSearchParams({
-      q: query,
+      q: normalizedQuery,
       type: "track",
       market,
       limit: "10"
     });
-    const res = await fetch(`${SPOTIFY_SEARCH_URL}?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const res = await fetchWithSpotifyRetry(`${SPOTIFY_SEARCH_URL}?${params.toString()}`, token);
     if (!res.ok) {
-      throw new Error("Spotify search failed");
+      if (res.status === 429) {
+        const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+        searchCooldownUntil = Date.now() + retryAfterMs;
+        // #region agent log
+        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+          body: JSON.stringify({
+            sessionId: "658713",
+            runId: "search-token-debug",
+            hypothesisId: "H47",
+            location: "src/services/spotify.ts:searchTracks",
+            message: "search cooldown set from 429 retry-after",
+            data: { query: normalizedQuery, source, retryAfterHeader: res.headers.get("retry-after"), retryAfterMs },
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+        // #endregion
+      }
+      debugLog(
+        "src/services/spotify.ts:searchTracks",
+        "spotify search failed",
+        { query: normalizedQuery, market, source, status: res.status },
+        "H37",
+        "metadata-genre-debug"
+      );
+      if (cached) {
+        debugLog(
+          "src/services/spotify.ts:searchTracks",
+          "serving stale cached search results after failure",
+          { query: normalizedQuery, market, cachedCount: cached.results.length, status: res.status },
+          "H40",
+          "metadata-genre-debug"
+        );
+        return cached.results;
+      }
+      return [];
     }
     const json = await res.json();
-    return (json.tracks?.items ?? []).map(normalizeTrack);
+    const results = (json.tracks?.items ?? []).map(normalizeTrack);
+    searchTracksCache.set(cacheKey, { expiresAt: Date.now() + SEARCH_TRACKS_TTL_MS, results });
+    return results;
+    })();
+    searchTracksInFlight.set(cacheKey, task);
+    try {
+      return await task;
+    } finally {
+      searchTracksInFlight.delete(cacheKey);
+    }
   },
 
   async getSupplementalTags(trackId: string): Promise<string[]> {
@@ -194,7 +298,19 @@ export const spotifyService = {
     if (supplementalTagsInFlight.has(trackId)) {
       return supplementalTagsInFlight.get(trackId) ?? [];
     }
-    const task = (async () => {
+    const queuedTask = async () => {
+    const now = Date.now();
+    if (supplementalCooldownUntil > now) {
+      const waitMs = supplementalCooldownUntil - now;
+      debugLog(
+        "src/services/spotify.ts:getSupplementalTags",
+        "waiting for supplemental cooldown window",
+        { trackId, waitMs },
+        "H35",
+        "metadata-genre-debug"
+      );
+      await sleep(waitMs);
+    }
     const token = await getToken();
     debugLog(
       "src/services/spotify.ts:getSupplementalTags",
@@ -202,10 +318,13 @@ export const spotifyService = {
       { trackId },
       "H5"
     );
-    const trackRes = await fetch(`${SPOTIFY_TRACKS_URL}/${encodeURIComponent(trackId)}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const trackRes = await fetchWithSpotifyRetry(`${SPOTIFY_TRACKS_URL}/${encodeURIComponent(trackId)}`, token);
     if (!trackRes.ok) {
+      if (trackRes.status === 429) {
+        const retryAfterHeader = trackRes.headers.get("retry-after");
+        const retryAfterMs = Math.max(1000, Number(retryAfterHeader ?? "2") * 1000);
+        supplementalCooldownUntil = Date.now() + retryAfterMs;
+      }
       debugLog(
         "src/services/spotify.ts:getSupplementalTags",
         "supplemental track request failed",
@@ -218,18 +337,31 @@ export const spotifyService = {
 
     const artistId = track?.artists?.[0]?.id ? String(track.artists[0].id) : "";
     const artistRes = artistId
-      ? await fetch(`${SPOTIFY_ARTISTS_URL}/${encodeURIComponent(artistId)}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        })
+      ? await fetchWithSpotifyRetry(`${SPOTIFY_ARTISTS_URL}/${encodeURIComponent(artistId)}`, token)
       : null;
+    if (artistRes && !artistRes.ok && artistRes.status === 429) {
+      const retryAfterHeader = artistRes.headers.get("retry-after");
+      const retryAfterMs = Math.max(1000, Number(retryAfterHeader ?? "2") * 1000);
+      supplementalCooldownUntil = Date.now() + retryAfterMs;
+    }
     const artist = artistRes && artistRes.ok ? await artistRes.json() : null;
 
-    const genreTags = Array.isArray(artist?.genres) ? artist.genres.map((genre: string) => normalizeTag(String(genre))) : [];
-    const heuristicTags = buildHeuristicTrackTags(track).map(normalizeTag);
-    const tags = Array.from(new Set([...genreTags, ...heuristicTags])).filter(Boolean).slice(0, 25);
+    const genreTags: string[] = Array.isArray(artist?.genres)
+      ? artist.genres.map((genre: string) => normalizeTag(String(genre)))
+      : [];
+    const tags: string[] = Array.from(new Set<string>(genreTags)).filter(Boolean).slice(0, 25);
+    debugLog(
+      "src/services/spotify.ts:getSupplementalTags",
+      "supplemental tags computed",
+      { trackId, genreTagCount: genreTags.length, finalTagCount: tags.length },
+      "H33",
+      "metadata-genre-debug"
+    );
     supplementalTagsCache.set(trackId, tags);
     return tags;
-    })();
+    };
+    const task = supplementalQueue.then(queuedTask, queuedTask);
+    supplementalQueue = task.then(() => undefined, () => undefined);
     supplementalTagsInFlight.set(trackId, task);
     try {
       return await task;

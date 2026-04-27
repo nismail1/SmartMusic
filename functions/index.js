@@ -527,3 +527,56 @@ exports.createSpotifyFirebaseSession = onRequest(createSpotifyAuthOptions, async
     });
   }
 });
+
+exports.getSuggestionReason = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const token = process.env.OPENAI_API_KEY || "";
+    if (!token) {
+      res.status(200).json({ reason: String(req.body?.baseReason || "").trim() || "Suggested based on co-occurrence with your playlist songs." });
+      return;
+    }
+    const context = req.body?.context || {};
+    const instruction = String(req.body?.instruction || "Write 1-2 specific sentences explaining why this track fits the playlist.");
+    const baseReason = String(req.body?.baseReason || "").trim();
+    const prompt = [
+      instruction,
+      `Candidate track: ${String(context?.trackName || "Unknown")} by ${(Array.isArray(context?.artists) ? context.artists.join(", ") : "") || "Unknown artist"}.`,
+      `Playlist tracks: ${Array.isArray(context?.playlistTrackNames) ? context.playlistTrackNames.join(", ") : "N/A"}.`,
+      `Seed matches: ${Array.isArray(context?.seedTrackNames) ? context.seedTrackNames.join(", ") : "N/A"}.`,
+      `Score breakdown: ${JSON.stringify(context?.scoreBreakdown || {})}.`,
+      `Base reason: ${baseReason || "N/A"}.`,
+      "Output exactly 1-2 sentences. No bullet points. No markdown."
+    ].join("\n");
+
+    const llmRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.3,
+        messages: [
+          { role: "system", content: "You are a recommendation explanation assistant. Be specific, concise, and factual based only on supplied evidence." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
+    if (!llmRes.ok) {
+      logger.warn("getSuggestionReason llm call failed", { status: llmRes.status });
+      res.status(200).json({ reason: baseReason || "Suggested based on co-occurrence with your playlist songs." });
+      return;
+    }
+    const payload = await llmRes.json();
+    const content = String(payload?.choices?.[0]?.message?.content || "").trim();
+    res.status(200).json({ reason: content || baseReason || "Suggested based on co-occurrence with your playlist songs." });
+  } catch (error) {
+    logger.error("getSuggestionReason failed", error);
+    res.status(200).json({ reason: String(req.body?.baseReason || "").trim() || "Suggested based on co-occurrence with your playlist songs." });
+  }
+});

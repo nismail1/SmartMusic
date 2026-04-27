@@ -46,6 +46,7 @@ interface TrackCooccurrenceCacheDoc {
 interface PlaylistSuggestionCacheDoc {
   playlistId: string;
   playlistTrackHash: string;
+  excludedHash: string;
   suggestions: RecommendationItem[];
   primarySuggestion: RecommendationItem | null;
   fetchedAt: number;
@@ -60,6 +61,7 @@ const TTL_MS = {
 } as const;
 
 const MIN_SUGGESTIONS = 5;
+const RETURN_SUGGESTIONS = 1;
 const MAX_SEEDS = 8;
 const PLAYLISTS_PER_SEED = 12;
 const TRACKS_PER_PUBLIC_PLAYLIST = 120;
@@ -95,8 +97,15 @@ function normalizeText(value: string): string {
     .trim();
 }
 
-function isLikelySpotifyTrackId(id: string): boolean {
-  return /^[A-Za-z0-9]{22}$/.test(id);
+function isSyntheticGenreTag(tag: string): boolean {
+  const normalized = String(tag).toLowerCase().trim();
+  return (
+    normalized.startsWith("era ") ||
+    normalized.startsWith("duration ") ||
+    normalized.startsWith("popularity ") ||
+    normalized === "explicit" ||
+    normalized === "unclassified"
+  );
 }
 
 function hashString(value: string): string {
@@ -120,6 +129,7 @@ function computeGenreProfile(tracks: PlaylistTrack[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const track of tracks) {
     for (const genre of track.genres ?? []) {
+      if (isSyntheticGenreTag(genre)) continue;
       const key = normalizeText(String(genre));
       if (!key) continue;
       counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -133,6 +143,7 @@ function computeGenreMatch(track: { genres?: string[] }, profile: Map<string, nu
   const total = track.genres.length;
   let hits = 0;
   for (const genre of track.genres) {
+    if (isSyntheticGenreTag(genre)) continue;
     if (profile.has(normalizeText(genre))) hits += 1;
   }
   return total ? hits / total : 0;
@@ -144,17 +155,58 @@ function buildReason(
   genreMatch: number,
   seedTrackNames: string[]
 ): string {
-  const topSeeds = seedTrackNames.slice(0, 2).map((name) => `‘${name}’`).join(" and ");
-  if (genreMatch >= 0.3) {
-    return "Suggested because it co-occurs with multiple songs in your playlist and matches your playlist genre profile.";
+  const topSeeds = seedTrackNames.slice(0, 3).map((name) => `‘${name}’`);
+  const seedPhrase = topSeeds.length > 1 ? `${topSeeds.slice(0, -1).join(", ")} and ${topSeeds[topSeeds.length - 1]}` : (topSeeds[0] ?? "songs in your playlist");
+  const genrePct = Math.round(genreMatch * 100);
+  if (seedCoverage >= 2 && genreMatch >= 0.25) {
+    return `Picked because it co-occurs with ${seedCoverage} of your playlist songs (${seedPhrase}) across ${cooccurCount} matching public playlists, and aligns with your genre profile (${genrePct}% match).`;
   }
-  if (seedCoverage >= 2 && topSeeds) {
-    return `Suggested because listeners who playlisted ${topSeeds} often also playlist this track.`;
+  if (seedCoverage >= 2) {
+    return `Picked because it co-occurs with ${seedCoverage} of your playlist songs (${seedPhrase}) across ${cooccurCount} matching public playlists.`;
   }
-  if (cooccurCount >= 2) {
-    return "Suggested because this track appears in several public Spotify playlists that also include songs from your playlist.";
+  if (genreMatch >= 0.25) {
+    return `Picked because it appears in ${cooccurCount} related public playlists and matches your playlist’s genre profile (${genrePct}% match).`;
   }
-  return "Suggested because this track co-occurs with songs from your playlist in Spotify playlists.";
+  return `Picked because it repeatedly appears in public playlists related to your current tracks (${cooccurCount} co-occurrence hits).`;
+}
+
+async function refineReasonWithLLM(
+  baseReason: string,
+  context: {
+    trackName: string;
+    artists: string[];
+    seedTrackNames: string[];
+    playlistTrackNames?: string[];
+    scoreBreakdown?: RecommendationItem["scoreBreakdown"];
+  }
+): Promise<string> {
+  const explicitEndpoint = (import.meta.env.VITE_REASON_LLM_ENDPOINT ?? "").trim();
+  const recommendationEndpoint = (import.meta.env.VITE_RECOMMENDATIONS_ENDPOINT ?? "").trim();
+  const derivedEndpoint = recommendationEndpoint
+    ? recommendationEndpoint.replace("getRecommendations", "getSuggestionReason")
+    : "";
+  const endpoint = explicitEndpoint || derivedEndpoint;
+  if (!endpoint) {
+    return `${baseReason} (LLM reason endpoint not configured)`;
+  }
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction:
+          "Write 1-2 specific sentences about why this track fits the playlist overall. Use provided playlist + cooccurrence evidence only. Do not invent facts.",
+        baseReason,
+        context
+      })
+    });
+    if (!response.ok) return `${baseReason} (LLM reason request failed: ${response.status})`;
+    const payload = (await response.json()) as { reason?: string };
+    const candidate = String(payload.reason ?? "").trim();
+    return candidate || `${baseReason} (LLM returned empty reason)`;
+  } catch {
+    return `${baseReason} (LLM reason request threw an error)`;
+  }
 }
 
 async function getCacheDoc<T extends { expiresAt: number }>(pathCollection: string, key: string): Promise<T | null> {
@@ -273,7 +325,7 @@ async function fallbackPopularityExcluding(excludedIds: Set<string>): Promise<Re
 
   const topUpSearches = ["top hits", "today's top hits", "popular tracks"];
   for (const queryText of topUpSearches) {
-    const searchTracks = await spotifyService.searchTracks(queryText);
+    const searchTracks = await spotifyService.searchTracks(queryText, "US", "recommendation-fallback-popularity");
     for (const track of searchTracks) {
       if (excludedIds.has(track.id) || recs.some((item) => item.songId === track.id)) continue;
       recs.push({
@@ -296,7 +348,14 @@ async function fallbackPopularityExcluding(excludedIds: Set<string>): Promise<Re
   return recs.slice(0, MIN_SUGGESTIONS);
 }
 
-async function buildCooccurrenceRecommendations(playlistId: string): Promise<RecommendationItem[]> {
+interface RecommendationOptions {
+  excludeSongIds?: string[];
+  forceRefresh?: boolean;
+}
+
+const recommendationsInFlight = new Map<string, Promise<RecommendationItem[]>>();
+
+async function buildCooccurrenceRecommendations(playlistId: string, options?: RecommendationOptions): Promise<RecommendationItem[]> {
   const tracksSnap = await getDocs(collection(db, "playlists", playlistId, "tracks"));
   const playlistTracks = tracksSnap.docs.map((docSnap) => {
     const data = docSnap.data() as Partial<PlaylistTrack>;
@@ -317,11 +376,22 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
   });
   const playlistTrackIds = playlistTracks.map((track) => track.id).filter(Boolean);
   const excludedIds = new Set(playlistTrackIds);
+  for (const excludedSongId of options?.excludeSongIds ?? []) {
+    if (excludedSongId) excludedIds.add(excludedSongId);
+  }
   if (!playlistTrackIds.length) return fallbackPopularityExcluding(excludedIds);
 
-  const cacheKey = `${playlistId}_${playlistTrackHash(playlistTrackIds)}`;
+  const excludedHash = hashString(Array.from(excludedIds).sort().join("|"));
+  const cacheKey = `${playlistId}_${playlistTrackHash(playlistTrackIds)}_${excludedHash}`;
+  debugLog(
+    "src/services/recommendations.ts:buildCooccurrenceRecommendations",
+    "building cooccurrence recommendations",
+    { playlistId, playlistTrackCount: playlistTrackIds.length, excludedCount: excludedIds.size, forceRefresh: Boolean(options?.forceRefresh), cacheKey },
+    "H15",
+    "suppression-debug"
+  );
   const suggestionCache = await getCacheDoc<PlaylistSuggestionCacheDoc>("playlist_suggestion_cache", cacheKey);
-  if (suggestionCache?.suggestions?.length) {
+  if (!options?.forceRefresh && suggestionCache?.suggestions?.length) {
     debugLog(
       "src/services/recommendations.ts:buildCooccurrenceRecommendations",
       "served suggestions from cache",
@@ -403,12 +473,13 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
       0.3 * normalizedSeedCoverage +
       0.1 * genreMatch +
       0.05 * novelty;
-    const reason = buildReason(
+    const baseReason = buildReason(
       coverage,
       count,
       genreMatch,
       Array.from(seedNamesByCandidate.get(candidateId) ?? [])
     );
+    const reason = baseReason;
     recs.push({
       songId: candidateId,
       spotifyId: candidateId,
@@ -439,7 +510,7 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
       .slice(0, 2)
       .map(([genre]) => genre);
     for (const genre of topGenres) {
-      const tracks = await spotifyService.searchTracks(genre, "US");
+      const tracks = await spotifyService.searchTracks(genre, "US", "recommendation-fallback-genre");
       for (const track of tracks) {
         if (excludedIds.has(track.id) || recs.some((item) => item.songId === track.id)) continue;
         fallbackByGenre.push({
@@ -469,6 +540,17 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
   }
 
   const finalSuggestions = recs.slice(0, MIN_SUGGESTIONS);
+  if (finalSuggestions[0]) {
+    const first = finalSuggestions[0];
+    const refined = await refineReasonWithLLM(first.reasons?.[0] ?? "", {
+      trackName: first.songName ?? first.songId,
+      artists: first.artists ?? [],
+      seedTrackNames: seedTracks.map((track) => track.name).slice(0, 5),
+      playlistTrackNames: playlistTracks.map((track) => track.name).slice(0, 12),
+      scoreBreakdown: first.scoreBreakdown
+    });
+    first.reasons = [refined];
+  }
   debugLog(
     "src/services/recommendations.ts:buildCooccurrenceRecommendations",
     "built suggestions fresh",
@@ -488,6 +570,7 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
   await setCacheDoc("playlist_suggestion_cache", cacheKey, {
     playlistId,
     playlistTrackHash: playlistTrackHash(playlistTrackIds),
+    excludedHash,
     suggestions: finalSuggestions,
     primarySuggestion: finalSuggestions[0] ?? null,
     fetchedAt: nowMs(),
@@ -496,138 +579,120 @@ async function buildCooccurrenceRecommendations(playlistId: string): Promise<Rec
   return finalSuggestions;
 }
 
-async function getFallbackRecommendationsOrThrow(playlistId: string): Promise<RecommendationItem[]> {
-  try {
-    return await buildCooccurrenceRecommendations(playlistId);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown fallback error";
-    throw new Error(`Recommendation fallback failed: ${message}`);
-  }
-}
-
-async function hydrateAndValidateSuggestions(items: RecommendationItem[]): Promise<RecommendationItem[]> {
-  const ids = Array.from(new Set(items.map((item) => item.songId).filter(Boolean)));
-  if (!ids.length) return [];
-  const resolvableIds = ids.filter((id) => isLikelySpotifyTrackId(id));
-  debugLog(
-    "src/services/recommendations.ts:hydrateAndValidateSuggestions",
-    "validating incoming suggestion IDs",
-    { totalIds: ids.length, spotifyLikeIds: resolvableIds.length },
-    "H10"
-  );
-  const tracks = await spotifyService.getTracksByIds(resolvableIds);
-  const byId = new Map(tracks.map((track) => [track.id, track]));
-  const hydratedDirect = items
-    .map((item) => {
-      const track = byId.get(item.songId);
-      if (!track) return null;
-      return {
-        ...item,
-        songId: track.id,
-        spotifyId: track.id,
-        songName: track.name,
-        artists: track.artists,
-        uri: track.uri,
-        albumName: track.albumName,
-        artworkUrl: track.artworkUrl,
-        previewUrl: track.previewUrl,
-        releaseDate: track.releaseDate,
-        durationMs: track.durationMs
-      } as RecommendationItem;
-    })
-    .filter((item): item is RecommendationItem => Boolean(item));
-  if (hydratedDirect.length >= MIN_SUGGESTIONS) return hydratedDirect;
-
-  const unresolved = items.filter((item) => !hydratedDirect.some((resolved) => resolved.songId === item.songId));
-  const recovered: RecommendationItem[] = [];
-  for (const item of unresolved) {
-    const query = [item.songName ?? "", item.artists?.[0] ?? ""].filter(Boolean).join(" ").trim();
-    if (!query) continue;
-    try {
-      const searchResults = await spotifyService.searchTracks(query);
-      const best = searchResults[0];
-      if (!best) continue;
-      recovered.push({
-        ...item,
-        songId: best.id,
-        spotifyId: best.id,
-        songName: best.name,
-        artists: best.artists,
-        uri: best.uri,
-        albumName: best.albumName,
-        artworkUrl: best.artworkUrl,
-        previewUrl: best.previewUrl,
-        releaseDate: best.releaseDate,
-        durationMs: best.durationMs
-      });
-    } catch {}
-    if (hydratedDirect.length + recovered.length >= MIN_SUGGESTIONS) break;
-  }
-  return [...hydratedDirect, ...recovered];
-}
-
 export const recommendationService = {
-  async getRecommendations(playlistId: string): Promise<RecommendationItem[]> {
-    const endpoint = import.meta.env.VITE_RECOMMENDATIONS_ENDPOINT ?? "";
-    if (endpoint) {
-      let response: Response;
-      try {
-        response = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ playlistId })
-        });
-      } catch {
-        return getFallbackRecommendationsOrThrow(playlistId);
-      }
-      if (!response.ok) {
-        return getFallbackRecommendationsOrThrow(playlistId);
-      }
-      const payload = (await response.json()) as { suggestions?: RecommendationItem[]; items?: RecommendationItem[] };
-      const fromApi = payload.suggestions ?? payload.items ?? [];
-      debugLog(
-        "src/services/recommendations.ts:getRecommendations",
-        "api recommendations payload",
-        {
-          endpoint,
-          count: fromApi.length,
-          sample: fromApi[0]
-            ? {
-                songId: fromApi[0].songId,
-                releaseDate: fromApi[0].releaseDate ?? null,
-                durationMs: fromApi[0].durationMs ?? null,
-                previewUrl: fromApi[0].previewUrl ?? null
-              }
-            : null
-        },
-        "H3"
-      );
-      const hydratedApi = await hydrateAndValidateSuggestions(fromApi);
-      debugLog(
-        "src/services/recommendations.ts:getRecommendations",
-        "api suggestions hydrated against spotify",
-        {
-          originalCount: fromApi.length,
-          hydratedCount: hydratedApi.length,
-          sample: hydratedApi[0]
-            ? {
-                songId: hydratedApi[0].songId,
-                releaseDate: hydratedApi[0].releaseDate ?? null,
-                durationMs: hydratedApi[0].durationMs ?? null,
-                previewUrl: hydratedApi[0].previewUrl ?? null
-              }
-            : null
-        },
-        "H8",
-        "post-fix"
-      );
-      if (hydratedApi.length >= MIN_SUGGESTIONS) {
-        return hydratedApi.slice(0, MIN_SUGGESTIONS);
-      }
-      const fallback = await getFallbackRecommendationsOrThrow(playlistId);
-      return [...hydratedApi, ...fallback.filter((item) => !hydratedApi.some((existing) => existing.songId === item.songId))]
-        .slice(0, MIN_SUGGESTIONS);
+  async getRecommendations(playlistId: string, options?: RecommendationOptions): Promise<RecommendationItem[]> {
+    const requestKey = `${playlistId}|${(options?.excludeSongIds ?? []).slice().sort().join(",")}|${options?.forceRefresh ? "force" : "normal"}`;
+    if (recommendationsInFlight.has(requestKey)) {
+      return recommendationsInFlight.get(requestKey) ?? [];
     }
-    return getFallbackRecommendationsOrThrow(playlistId);
+    const task = (async () => {
+    const endpoint = import.meta.env.VITE_RECOMMENDATIONS_ENDPOINT ?? "";
+    const excludedIds = new Set((options?.excludeSongIds ?? []).filter(Boolean));
+    debugLog(
+      "src/services/recommendations.ts:getRecommendations",
+      "recommendation request started",
+      {
+        playlistId,
+        hasEndpoint: Boolean(endpoint),
+        excludedCount: excludedIds.size,
+        forceRefresh: Boolean(options?.forceRefresh)
+      },
+      "H11",
+      "suppression-debug"
+    );
+    try {
+      if (endpoint) {
+        let response: Response;
+        try {
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ playlistId })
+          });
+        } catch {
+          debugLog(
+            "src/services/recommendations.ts:getRecommendations",
+            "api call failed, switching to fallback builder",
+            { playlistId },
+            "H12",
+            "suppression-debug"
+          );
+          return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+        }
+        if (!response.ok) {
+          debugLog(
+            "src/services/recommendations.ts:getRecommendations",
+            "api response not ok, switching to fallback builder",
+            { status: response.status, playlistId },
+            "H12",
+            "suppression-debug"
+          );
+          return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+        }
+        const payload = (await response.json()) as { suggestions?: RecommendationItem[]; items?: RecommendationItem[] };
+        const fromApi = payload.suggestions ?? payload.items ?? [];
+        const filteredFromApi = fromApi.filter((item) => !excludedIds.has(item.songId));
+        debugLog(
+          "src/services/recommendations.ts:getRecommendations",
+          "api recommendations payload",
+          {
+            endpoint,
+            count: filteredFromApi.length,
+            sample: filteredFromApi[0]
+              ? {
+                  songId: filteredFromApi[0].songId,
+                  releaseDate: filteredFromApi[0].releaseDate ?? null,
+                  durationMs: filteredFromApi[0].durationMs ?? null,
+                  previewUrl: filteredFromApi[0].previewUrl ?? null
+                }
+              : null
+          },
+          "H3"
+        );
+        if (filteredFromApi.length >= RETURN_SUGGESTIONS) {
+          debugLog(
+            "src/services/recommendations.ts:getRecommendations",
+            "using raw api suggestions without client hydration",
+            { count: filteredFromApi.length },
+            "H39",
+            "metadata-genre-debug"
+          );
+          return filteredFromApi.slice(0, RETURN_SUGGESTIONS);
+        }
+        const fallback = await buildCooccurrenceRecommendations(playlistId, options);
+        const filteredFallback = fallback.filter((item) => !excludedIds.has(item.songId));
+        debugLog(
+          "src/services/recommendations.ts:getRecommendations",
+          "combined api+fallback result computed",
+          {
+            hydratedCount: filteredFromApi.length,
+            fallbackCount: filteredFallback.length,
+            returnCount: [...filteredFromApi, ...filteredFallback.filter((item) => !filteredFromApi.some((existing) => existing.songId === item.songId))]
+              .slice(0, RETURN_SUGGESTIONS).length
+          },
+          "H13",
+          "suppression-debug"
+        );
+        return [...filteredFromApi, ...filteredFallback.filter((item) => !filteredFromApi.some((existing) => existing.songId === item.songId))]
+          .slice(0, RETURN_SUGGESTIONS);
+      }
+      return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+    } catch (error) {
+      debugLog(
+        "src/services/recommendations.ts:getRecommendations",
+        "recommendation request threw error",
+        { playlistId, message: error instanceof Error ? error.message : String(error) },
+        "H14",
+        "suppression-debug"
+      );
+      throw error;
+    }
+    })();
+    recommendationsInFlight.set(requestKey, task);
+    try {
+      return await task;
+    } finally {
+      recommendationsInFlight.delete(requestKey);
+    }
   }
 };
