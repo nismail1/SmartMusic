@@ -29,32 +29,41 @@ export function CreateAccountPage() {
   }
 
   return (
-    <section>
-      <h2>Create Account</h2>
-      <form onSubmit={handleSubmit} className="form">
-        <label>
-          Email
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            value={password}
-            minLength={8}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-          />
-        </label>
-        {error ? <p className="error">{error}</p> : null}
-        <button type="submit">Create Account</button>
-        <button type="button" onClick={() => void handleSpotifyLogin()}>
-          Continue with Spotify
-        </button>
-      </form>
-      <p>
-        Already have an account? <Link to="/login">Log in</Link>
-      </p>
-    </section>
+    <div className="page-public">
+      <div className="page-public__card">
+        <h1 className="page-lede" style={{ marginTop: 0 }}>
+          Create account
+        </h1>
+        <form onSubmit={handleSubmit} className="form">
+          <label>
+            Email
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" />
+          </label>
+          <label>
+            Password
+            <input
+              type="password"
+              value={password}
+              minLength={8}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </label>
+          {error ? <p className="error">{error}</p> : null}
+          <div className="page-public__actions">
+            <button type="submit" className="btn-primary">
+              Create account
+            </button>
+            <button type="button" onClick={() => void handleSpotifyLogin()}>
+              Continue with Spotify
+            </button>
+          </div>
+        </form>
+        <p style={{ marginBottom: 0, marginTop: 16, fontSize: "0.9rem" }}>
+          Already have an account? <Link to="/login">Log in</Link>
+        </p>
+      </div>
+    </div>
   );
 }

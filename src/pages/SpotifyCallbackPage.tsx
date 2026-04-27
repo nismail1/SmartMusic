@@ -23,8 +23,8 @@ export function SpotifyCallbackPage() {
         return;
       }
       try {
-        await authService.handleSpotifyCallback(code, state);
-        await authService.ensureFirestoreSession();
+        const session = await authService.handleSpotifyCallback(code, state);
+        await authService.signInWithSpotifyForFirestore(session.accessToken);
         await refreshSpotifySession();
         navigate("/home", { replace: true });
       } catch (err) {
@@ -35,9 +35,13 @@ export function SpotifyCallbackPage() {
   }, [params, navigate, refreshSpotifySession]);
 
   return (
-    <section>
-      <h2>Connecting Spotify</h2>
-      {error ? <p className="error">{error}</p> : <p>Finalizing sign-in...</p>}
-    </section>
+    <div className="page-public">
+      <div className="page-public__card">
+        <h1 className="page-lede" style={{ marginTop: 0 }}>
+          Connecting Spotify
+        </h1>
+        {error ? <p className="error">{error}</p> : <p>Finalizing sign-in…</p>}
+      </div>
+    </div>
   );
 }

@@ -1,17 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { SongDetailsDrawer } from "../components/SongDetailsDrawer";
+import { useAuth } from "../context/AuthContext";
 import { geniusService } from "../services/genius";
 import { computePlaylistAnalytics } from "../services/playlistAnalytics";
+import { playbackController } from "../services/playback";
 import { playlistService } from "../services/playlists";
 import { recommendationService } from "../services/recommendations";
-import type { GeniusEnrichment, PlaylistTrack, RecommendationItem } from "../types/music";
+import { spotifyService } from "../services/spotify";
+import type { GeniusEnrichment, PlaylistTrack, RecommendationItem, SpotifyTrack } from "../types/music";
 import { formatDuration } from "../lib/format";
 
 type SortKey = "addedAt" | "artist" | "releaseDate" | "durationMs";
 
 export function PlaylistPage() {
   const { playlistId = "" } = useParams();
+  const { authMode, spotifySession } = useAuth();
   const [playlistName, setPlaylistName] = useState("Playlist View");
   const [tracks, setTracks] = useState<PlaylistTrack[]>([]);
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>([]);
@@ -23,6 +27,7 @@ export function PlaylistPage() {
   const [drawerLoading, setDrawerLoading] = useState(false);
   const [drawerError, setDrawerError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [suggestionStatus, setSuggestionStatus] = useState("");
   const [sortBy, setSortBy] = useState<SortKey>("addedAt");
   const [activeGenreFilter, setActiveGenreFilter] = useState<string>("all");
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -110,6 +115,168 @@ export function PlaylistPage() {
     void openSongDetails(track, queue, queueIndex);
   }
 
+  async function handleSuggestionAdd(item: RecommendationItem) {
+    if (!playlistId) return;
+    try {
+      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
+      const trackToAdd: SpotifyTrack = fullTrack ?? {
+        id: item.songId,
+        name: item.songName ?? item.songId,
+        artists: item.artists ?? [],
+        uri: `spotify:track:${item.songId}`,
+        albumId: "",
+        albumName: "",
+        artworkUrl: item.artworkUrl ?? null,
+        previewUrl: item.previewUrl ?? null,
+        releaseDate: null,
+        durationMs: 0
+      };
+      await playlistService.addTrack(playlistId, trackToAdd);
+      setSuggestionStatus(`Added ${trackToAdd.name} to this playlist.`);
+      setTracks((prev) => [...prev, { ...trackToAdd, addedAt: new Date().toISOString() }]);
+    } catch {
+      setSuggestionStatus("Could not add this suggestion right now.");
+    }
+  }
+
+  async function handleSuggestionPlay(item: RecommendationItem) {
+    try {
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "suggestion-play-debug",
+          hypothesisId: "H4",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionPlay",
+          message: "play suggestion clicked",
+          data: {
+            songId: item.songId,
+            releaseDate: item.releaseDate ?? null,
+            durationMs: item.durationMs ?? null,
+            previewUrl: item.previewUrl ?? null
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "suggestion-play-debug",
+          hypothesisId: "H5",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionPlay",
+          message: "spotify track lookup result",
+          data: fullTrack
+            ? {
+                found: true,
+                trackId: fullTrack.id,
+                releaseDate: fullTrack.releaseDate ?? null,
+                durationMs: fullTrack.durationMs ?? null,
+                previewUrl: fullTrack.previewUrl ?? null,
+                uri: fullTrack.uri ?? null
+              }
+            : { found: false, requestedId: item.songId },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      const track: SpotifyTrack = fullTrack ?? {
+        id: item.songId,
+        name: item.songName ?? item.songId,
+        artists: item.artists ?? [],
+        uri: item.uri ?? `spotify:track:${item.songId}`,
+        albumId: "",
+        albumName: item.albumName ?? "",
+        artworkUrl: item.artworkUrl ?? null,
+        previewUrl: item.previewUrl ?? null,
+        releaseDate: item.releaseDate ?? null,
+        durationMs: Number(item.durationMs ?? 0)
+      };
+      await playbackController.play(track, {
+        preferSpotify: authMode === "spotify",
+        spotifyAccessToken: spotifySession?.accessToken ?? null,
+        spotifyScope: spotifySession?.scope ?? null,
+        queue: recommendations
+          .map((rec) => ({
+            id: rec.songId,
+            name: rec.songName ?? rec.songId,
+            artists: rec.artists ?? [],
+            uri: rec.uri ?? `spotify:track:${rec.songId}`,
+            albumId: "",
+            albumName: rec.albumName ?? "",
+            artworkUrl: rec.artworkUrl ?? null,
+            previewUrl: rec.previewUrl ?? null,
+            releaseDate: rec.releaseDate ?? null,
+            durationMs: Number(rec.durationMs ?? 0)
+          }))
+          .filter((recTrack) => Boolean(recTrack.id)),
+        index: recommendations.findIndex((rec) => rec.songId === item.songId)
+      });
+    } catch {
+      // #region agent log
+      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+        body: JSON.stringify({
+          sessionId: "658713",
+          runId: "suggestion-play-debug",
+          hypothesisId: "H6",
+          location: "src/pages/PlaylistPage.tsx:handleSuggestionPlay",
+          message: "playback failed in suggestion flow",
+          data: { songId: item.songId },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      setSuggestionStatus("Unable to play this suggestion right now.");
+    }
+  }
+
+  async function handleSuggestionClick(item: RecommendationItem) {
+    try {
+      const fullTrack = (await spotifyService.getTracksByIds([item.songId]))[0];
+      const track: PlaylistTrack = fullTrack
+        ? { ...fullTrack, addedAt: new Date().toISOString() }
+        : {
+            id: item.songId,
+            name: item.songName ?? item.songId,
+            artists: item.artists ?? [],
+            uri: item.uri ?? `spotify:track:${item.songId}`,
+            albumId: "",
+            albumName: item.albumName ?? "",
+            artworkUrl: item.artworkUrl ?? null,
+            previewUrl: item.previewUrl ?? null,
+            releaseDate: item.releaseDate ?? null,
+            durationMs: Number(item.durationMs ?? 0),
+            genres: [],
+            addedAt: new Date().toISOString()
+          };
+      await openSongDetails(track);
+    } catch {
+      const fallbackTrack: PlaylistTrack = {
+        id: item.songId,
+        name: item.songName ?? item.songId,
+        artists: item.artists ?? [],
+        uri: item.uri ?? `spotify:track:${item.songId}`,
+        albumId: "",
+        albumName: item.albumName ?? "",
+        artworkUrl: item.artworkUrl ?? null,
+        previewUrl: item.previewUrl ?? null,
+        releaseDate: item.releaseDate ?? null,
+        durationMs: Number(item.durationMs ?? 0),
+        genres: [],
+        addedAt: new Date().toISOString()
+      };
+      await openSongDetails(fallbackTrack);
+    }
+  }
+
   const sortedAndFilteredTracks = useMemo(() => {
     let next = [...tracks];
     if (activeGenreFilter !== "all") {
@@ -137,13 +304,19 @@ export function PlaylistPage() {
 
   return (
     <section>
-      <h2>{playlistName}</h2>
+      <h2 className="page-title" style={{ fontSize: "2rem" }}>
+        {playlistName}
+      </h2>
       {loading ? <p>Loading playlist...</p> : null}
 
       <h3>Overview</h3>
-      <p>Total duration: {formatDuration(analytics.totalDurationMs)}</p>
-      <p>Decades: {Object.entries(analytics.decadeBreakdown).map(([d, c]) => `${d} (${c})`).join(", ") || "None"}</p>
-      <p>Genres: {Object.entries(analytics.genreComposition).map(([g, c]) => `${g} (${c})`).join(", ") || "None"}</p>
+      <div className="page-section" style={{ marginTop: 8 }}>
+        <p style={{ margin: "0 0 8px" }}>Total duration: {formatDuration(analytics.totalDurationMs)}</p>
+        <p style={{ margin: "0 0 8px" }}>
+          Decades: {Object.entries(analytics.decadeBreakdown).map(([d, c]) => `${d} (${c})`).join(", ") || "None"}
+        </p>
+        <p style={{ margin: 0 }}>Genres: {Object.entries(analytics.genreComposition).map(([g, c]) => `${g} (${c})`).join(", ") || "None"}</p>
+      </div>
 
       <div className="filters">
         <label>
@@ -199,13 +372,27 @@ export function PlaylistPage() {
 
       <h3>Suggestions</h3>
       {recommendationError ? <p className="error">{recommendationError}</p> : null}
-      {!recommendationError && !recommendations.length ? <p>No suggestions yet.</p> : null}
-      <ul>
+      {suggestionStatus ? <p>{suggestionStatus}</p> : null}
+      {!recommendationError && !recommendations.length ? <p style={{ color: "var(--color-muted)" }}>No suggestions yet.</p> : null}
+      <ul className="suggestions-list">
         {recommendations.map((item) => (
           <li key={item.songId}>
-            <strong>{item.songName ?? item.songId}</strong>
-            {item.artists?.length ? ` - ${item.artists.join(", ")}` : ""}
+            <button type="button" className="track-link-button" onClick={() => void handleSuggestionClick(item)}>
+              <strong>{item.songName ?? item.songId}</strong>
+              {item.artists?.length ? ` — ${item.artists.join(", ")}` : ""}
+            </button>
+            <div style={{ color: "var(--color-muted)", fontSize: "0.85rem" }}>
+              {(item.releaseDate ?? "Unknown release")} | {formatDuration(Number(item.durationMs ?? 0))}
+            </div>
             <div>{item.reasons?.[0] ?? "Picked to fit this playlist right now."}</div>
+            <div className="actions" style={{ marginTop: 6 }}>
+              <button type="button" onClick={() => void handleSuggestionPlay(item)}>
+                Play preview
+              </button>
+              <button type="button" onClick={() => void handleSuggestionAdd(item)}>
+                Add to playlist
+              </button>
+            </div>
           </li>
         ))}
       </ul>

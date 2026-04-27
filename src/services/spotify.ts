@@ -4,6 +4,7 @@ const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search";
 const SPOTIFY_TRACKS_URL = "https://api.spotify.com/v1/tracks";
 const SPOTIFY_ARTISTS_URL = "https://api.spotify.com/v1/artists";
+const SPOTIFY_PLAYLISTS_URL = "https://api.spotify.com/v1/playlists";
 
 function debugLog(
   location: string,
@@ -88,6 +89,29 @@ function normalizePlaylistTrackFromEmbedded(track: any): SpotifyTrack | null {
   return normalizeTrack(track);
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithSpotifyRetry(url: string, token: string, init?: RequestInit): Promise<Response> {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(init?.headers ?? {})
+      }
+    });
+    if (response.status !== 429) return response;
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterMs = Math.max(300, Number(retryAfterHeader ?? "1") * 1000);
+    if (attempt === maxAttempts) return response;
+    await sleep(retryAfterMs + Math.floor(Math.random() * 250));
+  }
+  throw new Error("Spotify request exhausted retries.");
+}
+
 export interface SpotifyUserProfile {
   id: string;
   displayName: string;
@@ -103,6 +127,13 @@ export interface SpotifyUserPlaylist {
   ownerId: string | null;
   tracksHref: string | null;
   itemsHref: string | null;
+}
+
+export interface SpotifyPublicPlaylist {
+  id: string;
+  name: string;
+  ownerId: string | null;
+  trackCount: number;
 }
 
 function normalizeTag(value: string): string {
@@ -226,11 +257,39 @@ export const spotifyService = {
     const items: SpotifyUserPlaylist[] = [];
     let nextUrl: string | null = "https://api.spotify.com/v1/me/playlists?limit=50";
     while (nextUrl) {
-      const response: Response = await fetch(nextUrl, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      if (!response.ok) {
-        throw new Error("Failed to load Spotify playlists.");
+      const maxAttempts = 3;
+      let response: Response | null = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        response = await fetch(nextUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        if (response.ok) break;
+        const transient = [502, 503, 504].includes(response.status);
+        if (transient && attempt < maxAttempts) {
+          // #region agent log
+          fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+            body: JSON.stringify({
+              sessionId: "658713",
+              runId: "spotify-playlist-retry",
+              hypothesisId: "H4",
+              location: "src/services/spotify.ts:listCurrentUserPlaylists",
+              message: "transient spotify error, retrying",
+              data: { status: response.status, attempt, nextUrl: nextUrl.slice(0, 60) },
+              timestamp: Date.now()
+            })
+          }).catch(() => {});
+          // #endregion
+          await new Promise((r) => setTimeout(r, 400 * attempt));
+          continue;
+        }
+        break;
+      }
+      if (!response || !response.ok) {
+        throw new Error(
+          "Failed to load Spotify playlists. If Spotify is busy, try again in a few seconds."
+        );
       }
       const payload: any = await response.json();
       debugLog(
@@ -441,5 +500,104 @@ export const spotifyService = {
       "M53"
     );
     return tracks;
+  },
+
+  async searchPublicPlaylists(query: string, limit = 12): Promise<SpotifyPublicPlaylist[]> {
+    const normalized = query.trim();
+    if (!normalized) return [];
+    const token = await getToken();
+    const params = new URLSearchParams({
+      q: normalized,
+      type: "playlist",
+      market: "US",
+      limit: String(Math.max(1, Math.min(50, limit)))
+    });
+    const response = await fetchWithSpotifyRetry(`${SPOTIFY_SEARCH_URL}?${params.toString()}`, token);
+    if (!response.ok) {
+      throw new Error(`Spotify public playlist search failed (${response.status}).`);
+    }
+    const payload: any = await response.json();
+    const items = Array.isArray(payload?.playlists?.items) ? payload.playlists.items : [];
+    return items
+      .filter((item: any) => Boolean(item?.id))
+      .map((item: any) => ({
+        id: String(item.id),
+        name: String(item?.name ?? "Untitled Spotify playlist"),
+        ownerId: item?.owner?.id ? String(item.owner.id) : null,
+        trackCount: Number(item?.tracks?.total ?? 0)
+      }));
+  },
+
+  async getPublicPlaylistTracks(playlistId: string, limit = 120): Promise<SpotifyTrack[]> {
+    if (!playlistId) return [];
+    const token = await getToken();
+    const tracks: SpotifyTrack[] = [];
+    let nextUrl: string | null = `${SPOTIFY_PLAYLISTS_URL}/${encodeURIComponent(playlistId)}/items?limit=100`;
+    while (nextUrl && tracks.length < limit) {
+      const response = await fetchWithSpotifyRetry(nextUrl, token);
+      if (!response.ok) {
+        throw new Error(`Spotify playlist tracks fetch failed (${response.status}).`);
+      }
+      const payload: any = await response.json();
+      const pageItems = Array.isArray(payload?.items) ? payload.items : [];
+      tracks.push(...pageItems.map(normalizePlaylistTrack).filter(Boolean) as SpotifyTrack[]);
+      nextUrl = payload?.next ? String(payload.next) : null;
+    }
+    return tracks.slice(0, limit);
+  },
+
+  async getTracksByIds(trackIds: string[]): Promise<SpotifyTrack[]> {
+    const uniqueIds = Array.from(new Set(trackIds.map((id) => id.trim()).filter(Boolean)));
+    if (!uniqueIds.length) return [];
+    debugLog(
+      "src/services/spotify.ts:getTracksByIds",
+      "track lookup started",
+      { requestedCount: uniqueIds.length, sampleIds: uniqueIds.slice(0, 3) },
+      "H7"
+    );
+    const token = await getToken();
+    const batches: string[][] = [];
+    for (let i = 0; i < uniqueIds.length; i += 50) {
+      batches.push(uniqueIds.slice(i, i + 50));
+    }
+    const all: SpotifyTrack[] = [];
+    for (const batch of batches) {
+      const params = new URLSearchParams({ ids: batch.join(",") });
+      const response = await fetchWithSpotifyRetry(`${SPOTIFY_TRACKS_URL}?${params.toString()}`, token);
+      if (!response.ok) {
+        let bodyPreview = "";
+        try {
+          bodyPreview = (await response.text()).slice(0, 200);
+        } catch {}
+        debugLog(
+          "src/services/spotify.ts:getTracksByIds",
+          "track lookup batch failed",
+          { status: response.status, batchSize: batch.length, bodyPreview },
+          "H7"
+        );
+        continue;
+      }
+      const payload: any = await response.json();
+      const tracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+      all.push(...tracks.filter(Boolean).map(normalizeTrack));
+    }
+    debugLog(
+      "src/services/spotify.ts:getTracksByIds",
+      "track lookup finished",
+      {
+        requestedCount: uniqueIds.length,
+        returnedCount: all.length,
+        sample: all[0]
+          ? {
+              id: all[0].id,
+              releaseDate: all[0].releaseDate ?? null,
+              durationMs: all[0].durationMs ?? null,
+              previewUrl: all[0].previewUrl ?? null
+            }
+          : null
+      },
+      "H7"
+    );
+    return all;
   }
 };

@@ -82,25 +82,28 @@ export function SearchResultsPage() {
 
   return (
     <section>
-      <h2>Search Results</h2>
-      <form onSubmit={runSearch} className="form inline">
-        <input value={queryText} onChange={(e) => setQueryText(e.target.value)} placeholder="Search Spotify tracks" />
-        <button type="submit">Search</button>
-      </form>
-
-      <label>
-        Target playlist
-        <select value={selectedPlaylistId} onChange={(e) => setSelectedPlaylistId(e.target.value)}>
-          {playlists.map((playlist) => (
-            <option key={playlist.id} value={playlist.id}>
-              {playlist.name}
-            </option>
-          ))}
-        </select>
-      </label>
+      <h2 className="page-title" style={{ fontSize: "1.75rem" }}>
+        Search
+      </h2>
+      <div className="page-section" style={{ marginTop: 20, marginBottom: 20 }}>
+        <form onSubmit={runSearch} className="form inline" style={{ marginBottom: 0 }}>
+          <input value={queryText} onChange={(e) => setQueryText(e.target.value)} placeholder="Search Spotify tracks" />
+          <button type="submit">Search</button>
+        </form>
+        <label style={{ display: "grid", gap: 8, marginTop: 16, fontSize: "0.9rem", fontWeight: 500 }}>
+          Target playlist
+          <select value={selectedPlaylistId} onChange={(e) => setSelectedPlaylistId(e.target.value)}>
+            {playlists.map((playlist) => (
+              <option key={playlist.id} value={playlist.id}>
+                {playlist.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
       {status ? <p>{status}</p> : null}
       {loading ? <p>Searching Spotify...</p> : null}
-      {!hasResults && !loading ? <p>No results yet.</p> : null}
+      {!hasResults && !loading ? <p style={{ color: "var(--color-muted)" }}>No results yet.</p> : null}
       <ul className="track-list">
         {results.map((track) => (
           <li key={track.id}>

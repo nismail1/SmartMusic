@@ -13,7 +13,9 @@
     "seed:generate": "node --loader ts-node/esm scripts/seedSyntheticData.ts",
     "seed:build-aggregates": "node --loader ts-node/esm scripts/buildCooccurrence.ts",
     "seed:verify": "node --loader ts-node/esm scripts/verifySeedData.ts",
-    "seed:firestore": "node --loader ts-node/esm scripts/seedToFirestore.ts"
+    "seed:firestore": "node --loader ts-node/esm scripts/seedToFirestore.ts",
+    "deploy:functions": "npx firebase-tools@latest deploy --only functions",
+    "deploy:functions:spotify-auth": "npx firebase-tools@latest deploy --only functions:createSpotifyFirebaseSession"
   },
   "repository": {
     "type": "git",

@@ -4,6 +4,7 @@ import { playbackController, type PlaybackState } from "../services/playback";
 import { formatDuration } from "../lib/format";
 
 const POS_KEY = "smartmusic.floatingPlayer.position";
+const PLAYER_W = 240;
 
 const initialPlaybackState: PlaybackState = {
   isPlaying: false,
@@ -30,7 +31,21 @@ function readSavedPosition(): { x: number; y: number } | null {
 function defaultPosition() {
   const w = typeof window !== "undefined" ? window.innerWidth : 400;
   const h = typeof window !== "undefined" ? window.innerHeight : 600;
-  return { x: Math.max(16, w - 16 - 220), y: Math.max(16, h - 16 - 220) };
+  return { x: Math.max(16, w - 16 - PLAYER_W), y: Math.max(16, h - 16 - 280) };
+}
+
+function VinylDisc() {
+  return (
+    <div className="floating-player__disc" aria-hidden>
+      <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="50" cy="50" r="48" fill="#1a1a1a" stroke="#fdecec" strokeWidth="0.5" />
+        <circle cx="50" cy="50" r="40" stroke="#fdecec" strokeOpacity="0.35" strokeWidth="0.4" />
+        <circle cx="50" cy="50" r="32" stroke="#fdecec" strokeOpacity="0.3" strokeWidth="0.35" />
+        <circle cx="50" cy="50" r="24" stroke="#fdecec" strokeOpacity="0.25" strokeWidth="0.3" />
+        <circle cx="50" cy="50" r="8" fill="#0a0a0a" stroke="#fdecec" strokeWidth="0.4" />
+      </svg>
+    </div>
+  );
 }
 
 export function FloatingPlayer() {
@@ -45,43 +60,6 @@ export function FloatingPlayer() {
   useEffect(() => playbackController.subscribe(setState), []);
 
   useEffect(() => {
-    // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
-      body: JSON.stringify({
-        sessionId: "658713",
-        runId: "playback-debug",
-        hypothesisId: "H9",
-        location: "src/components/FloatingPlayer.tsx:useEffect",
-        message: "floating player mounted in AppLayout (persists across route Outlet)",
-        data: {},
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-    // #endregion
-  }, []);
-
-  useEffect(() => {
-    if (!state.currentTrack) return;
-    // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
-      body: JSON.stringify({
-        sessionId: "658713",
-        runId: "playback-debug",
-        hypothesisId: "H10",
-        location: "src/components/FloatingPlayer.tsx:useEffect",
-        message: "floating player visible (has currentTrack)",
-        data: { trackId: state.currentTrack.id },
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-    // #endregion
-  }, [state.currentTrack]);
-
-  useEffect(() => {
     if (!dragging) return;
     const onMove = (e: PointerEvent) => {
       if (!dragRef.current) return;
@@ -89,9 +67,8 @@ export function FloatingPlayer() {
       const dy = e.clientY - dragRef.current.startY;
       const w = window.innerWidth;
       const h = window.innerHeight;
-      const size = 200;
-      const nextX = Math.min(Math.max(8, dragRef.current.origX + dx), w - size - 8);
-      const nextY = Math.min(Math.max(8, dragRef.current.origY + dy), h - size - 8);
+      const nextX = Math.min(Math.max(8, dragRef.current.origX + dx), w - PLAYER_W - 8);
+      const nextY = Math.min(Math.max(8, dragRef.current.origY + dy), h - 8);
       setPos({ x: nextX, y: nextY });
     };
     const onUp = () => {
@@ -114,18 +91,16 @@ export function FloatingPlayer() {
     };
   }, [dragging]);
 
-  const onDragStart = useCallback(
-    (e: React.PointerEvent) => {
-      e.preventDefault();
-      dragRef.current = { startX: e.clientX, startY: e.clientY, origX: posRef.current.x, origY: posRef.current.y };
-      setDragging(true);
-    },
-    []
-  );
+  const onDragStart = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origX: posRef.current.x, origY: posRef.current.y };
+    setDragging(true);
+  }, []);
 
   const track = state.currentTrack;
   if (!track) return null;
   const activeTrack = track;
+  const artLetter = (activeTrack.name || "?").charAt(0).toUpperCase();
 
   async function handlePlayPause() {
     if (state.currentTrackId === activeTrack.id && state.isPlaying) {
@@ -153,13 +128,20 @@ export function FloatingPlayer() {
 
   return (
     <div className="floating-player" style={{ left: pos.x, top: pos.y }} role="region" aria-label="Now playing">
-      <div
-        className="floating-player-drag"
-        onPointerDown={onDragStart}
-        title="Drag to move"
-      />
+      <div className="floating-player__titlebar" onPointerDown={onDragStart} title="Drag to move">
+        <span>Now playing</span>
+      </div>
+      <div className="floating-player__body">
+        {activeTrack.artworkUrl ? (
+          <img className="floating-player__art" src={activeTrack.artworkUrl} alt="" width={112} height={112} />
+        ) : (
+          <div className="floating-player__art floating-player__art--placeholder" style={{ width: 112, height: 112 }}>
+            {artLetter}
+          </div>
+        )}
+        <VinylDisc />
+      </div>
       <div className="floating-player-chrome">
-        {activeTrack.artworkUrl ? <img className="floating-player-art" src={activeTrack.artworkUrl} alt="" width={200} height={200} /> : null}
         <div className="floating-player-meta">
           <div className="floating-player-title">{activeTrack.name}</div>
           <div className="floating-player-artist">{activeTrack.artists.join(", ")}</div>
@@ -174,7 +156,7 @@ export function FloatingPlayer() {
               Next
             </button>
           ) : null}
-          <button type="button" onClick={() => playbackController.stop()} aria-label="Stop">
+          <button type="button" onClick={() => void playbackController.stop(spotifySession?.accessToken ?? null)} aria-label="Stop">
             Stop
           </button>
         </div>

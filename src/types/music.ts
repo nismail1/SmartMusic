@@ -37,8 +37,21 @@ export interface Playlist {
 
 export interface RecommendationItem {
   songId: string;
+  spotifyId?: string;
   songName?: string;
   artists?: string[];
+  uri?: string;
+  albumName?: string;
+  artworkUrl?: string | null;
+  previewUrl?: string | null;
+  releaseDate?: string | null;
+  durationMs?: number;
   score: number;
   reasons: string[];
+  scoreBreakdown?: {
+    cooccurCount: number;
+    seedCoverage: number;
+    genreMatch: number;
+    novelty: number;
+  };
 }

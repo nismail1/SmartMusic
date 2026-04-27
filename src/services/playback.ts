@@ -192,9 +192,86 @@ class PlaybackController {
     });
   }
 
-  stop() {
+  async stop(spotifyAccessToken?: string | null) {
+    const mode = this.state.mode;
+    // #region agent log
+    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+      body: JSON.stringify({
+        sessionId: "658713",
+        runId: "stop-verify",
+        hypothesisId: "H1",
+        location: "src/services/playback.ts:stop",
+        message: "stop() entered",
+        data: { mode, hasSpotifyPlayer: Boolean(this.spotifyPlayer) },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+
+    this.setContext(undefined, undefined);
     this.audio.pause();
     this.audio.currentTime = 0;
+
+    if (mode === "spotify" && this.spotifyPlayer) {
+      try {
+        await this.spotifyPlayer.pause();
+        // #region agent log
+        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+          body: JSON.stringify({
+            sessionId: "658713",
+            runId: "stop-verify",
+            hypothesisId: "H1",
+            location: "src/services/playback.ts:stop",
+            message: "spotify web playback SDK pause completed",
+            data: {},
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+        // #endregion
+      } catch (err) {
+        debugLog(
+          "src/services/playback.ts:stop",
+          "spotify player pause error",
+          { message: err instanceof Error ? err.message : "unknown" },
+          "H1"
+        );
+      }
+    }
+    if (mode === "spotify" && spotifyAccessToken) {
+      try {
+        const r = await fetch("https://api.spotify.com/v1/me/player/pause", {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${spotifyAccessToken}` }
+        });
+        // #region agent log
+        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+          body: JSON.stringify({
+            sessionId: "658713",
+            runId: "stop-verify",
+            hypothesisId: "H2",
+            location: "src/services/playback.ts:stop",
+            message: "REST /me/player/pause",
+            data: { status: r.status, ok: r.ok },
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+        // #endregion
+      } catch (err) {
+        debugLog(
+          "src/services/playback.ts:stop",
+          "REST pause failed",
+          { message: err instanceof Error ? err.message : "unknown" },
+          "H2"
+        );
+      }
+    }
+
     this.setState({ isPlaying: false, mode: "none", currentTrackId: null, currentTrack: null, queueHasNext: false, error: "" });
   }
 

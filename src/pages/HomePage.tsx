@@ -54,9 +54,9 @@ export function HomePage() {
   useEffect(() => {
     async function run() {
       let ownerId = user?.uid ?? "";
-      if (!ownerId && authMode === "spotify") {
+      if (!ownerId && authMode === "spotify" && spotifySession?.accessToken) {
         try {
-          const firebaseUser = await authService.ensureFirestoreSession();
+          const firebaseUser = await authService.signInWithSpotifyForFirestore(spotifySession.accessToken);
           ownerId = firebaseUser.uid;
           setSpotifyImportBlockedReason("");
           debugLog("src/pages/HomePage.tsx:run", "ensured firebase session for spotify mode", { ownerId }, "M36");
@@ -69,19 +69,35 @@ export function HomePage() {
           return;
         }
       }
-      if (!ownerId) return;
+      if (!ownerId) {
+        debugLog("src/pages/HomePage.tsx:run", "bailed no ownerId", { authMode, hasUser: Boolean(user) }, "H4");
+        return;
+      }
       setLoading(true);
       setError("");
       try {
-        setPlaylists(await playlistService.listPlaylists(ownerId));
+        const pl = await playlistService.listPlaylists(ownerId);
+        setPlaylists(pl);
+        debugLog(
+          "src/pages/HomePage.tsx:run",
+          "listPlaylists result",
+          { ownerId, count: pl.length, authMode, hasFirebaseUser: Boolean(user) },
+          "H2"
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load playlists");
+        debugLog(
+          "src/pages/HomePage.tsx:run",
+          "listPlaylists failed",
+          { ownerId, message: err instanceof Error ? err.message : String(err) },
+          "H3"
+        );
       } finally {
         setLoading(false);
       }
     }
     void run();
-  }, [user?.uid, authMode]);
+  }, [user?.uid, authMode, spotifySession?.accessToken]);
 
   useEffect(() => {
     async function loadSpotifyPlaylists() {
@@ -112,7 +128,11 @@ export function HomePage() {
     let ownerId = user?.uid ?? "";
     if (!ownerId) {
       try {
-        ownerId = (await authService.ensureFirestoreSession()).uid;
+        if (authMode === "spotify" && spotifySession?.accessToken) {
+          ownerId = (await authService.signInWithSpotifyForFirestore(spotifySession.accessToken)).uid;
+        } else {
+          ownerId = (await authService.ensureFirestoreSession()).uid;
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unable to create playlist.");
         return;
@@ -133,7 +153,11 @@ export function HomePage() {
     let ownerId = user?.uid ?? "";
     if (!ownerId) {
       try {
-        ownerId = (await authService.ensureFirestoreSession()).uid;
+        if (authMode === "spotify" && spotifySession?.accessToken) {
+          ownerId = (await authService.signInWithSpotifyForFirestore(spotifySession.accessToken)).uid;
+        } else {
+          ownerId = (await authService.ensureFirestoreSession()).uid;
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : "Spotify import is blocked due to Firebase auth configuration.";
         setImportStatus(message);
@@ -266,9 +290,15 @@ export function HomePage() {
 
   return (
     <section>
-      <h2>Home</h2>
+      <h2 className="page-title" style={{ fontSize: "2rem", marginBottom: "0.25em" }}>
+        Make better playlists.
+      </h2>
+      <p style={{ color: "var(--color-muted)", maxWidth: "42rem" }}>
+        Create lists, import from Spotify, and search the catalog — your library lives here.
+      </p>
+
       {authMode === "spotify" ? (
-        <section>
+        <section className="page-section" style={{ marginTop: 24 }}>
           <h3>Import from Spotify</h3>
           {loadingSpotifyPlaylists ? <p>Loading Spotify playlists...</p> : null}
           {!loadingSpotifyPlaylists ? <p>Found {spotifyPlaylists.length} playlists in your Spotify account.</p> : null}
@@ -291,50 +321,65 @@ export function HomePage() {
               ))}
             </select>
           </label>
-          <button
-            type="button"
-            onClick={() => void importSpotifyPlaylists()}
-            disabled={importingSpotify || !selectedSpotifyPlaylistId || Boolean(spotifyImportBlockedReason)}
-          >
-            {importingSpotify ? "Importing..." : "Import selected Spotify playlist"}
-          </button>
+          <div className="actions" style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              onClick={() => void importSpotifyPlaylists()}
+              disabled={importingSpotify || !selectedSpotifyPlaylistId || Boolean(spotifyImportBlockedReason)}
+            >
+              {importingSpotify ? "Importing..." : "Import selected Spotify playlist"}
+            </button>
+          </div>
           {spotifyImportBlockedReason ? <p className="error">{spotifyImportBlockedReason}</p> : null}
           {importStatus ? <p>{importStatus}</p> : null}
         </section>
       ) : null}
-      <form onSubmit={handleCreatePlaylist} className="form inline">
-        <input
-          placeholder="New playlist name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          aria-label="New playlist name"
-        />
-        <button type="submit">Create Playlist</button>
-      </form>
 
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          navigate(`/search?query=${encodeURIComponent(search)}`);
-        }}
-        className="form inline"
-      >
-        <input
-          placeholder="Search songs in Spotify"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          aria-label="Search songs"
-        />
-        <button type="submit">Search</button>
-      </form>
+      <div className="page-section" style={{ marginTop: 24 }}>
+        <h3>New playlist</h3>
+        <form onSubmit={handleCreatePlaylist} className="form inline">
+          <input
+            placeholder="Name your playlist"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            aria-label="New playlist name"
+          />
+          <button type="submit">Create</button>
+        </form>
+      </div>
 
-      <h3>Your Playlists</h3>
+      <div className="page-section" style={{ marginTop: 20 }}>
+        <h3>Search</h3>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            navigate(`/search?query=${encodeURIComponent(search)}`);
+          }}
+          className="form inline"
+        >
+          <input
+            placeholder="Search songs in Spotify"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search songs"
+          />
+          <button type="submit">Search</button>
+        </form>
+      </div>
+
+      <h3 style={{ marginTop: 32 }}>Your Playlists</h3>
       {loading ? <p>Loading playlists...</p> : null}
       {error ? <p className="error">{error}</p> : null}
-      <ul>
+      {filtered.length === 0 && !loading ? <p style={{ color: "var(--color-muted)" }}>No playlists yet. Create one above.</p> : null}
+      <ul className="playlist-grid" style={{ marginTop: 12 }}>
         {filtered.map((playlist) => (
           <li key={playlist.id}>
-            <Link to={`/playlists/${playlist.id}`}>{playlist.name}</Link>
+            <Link to={`/playlists/${playlist.id}`} className="playlist-card">
+              <div className="playlist-card__cover" aria-hidden>
+                {playlist.name.charAt(0).toUpperCase()}
+              </div>
+              <div className="playlist-card__body">{playlist.name}</div>
+            </Link>
           </li>
         ))}
       </ul>

@@ -5,6 +5,12 @@ const admin = require("firebase-admin");
 admin.initializeApp();
 const db = admin.firestore();
 
+/** Gen2 default runtime is often the Compute SA; custom tokens require signBlob. Run as App Engine default. */
+function getAppspotServiceAccount() {
+  const projectId = process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || admin.app().options?.projectId;
+  return projectId ? `${String(projectId)}@appspot.gserviceaccount.com` : undefined;
+}
+
 function normalizeMap(values) {
   const entries = Array.from(values.entries());
   const max = Math.max(0, ...entries.map(([, value]) => value));
@@ -21,11 +27,8 @@ function scoreCandidate({ playlistSimilarity, searchSimilarity, globalEngagement
   );
 }
 
-function buildReasons({ playlistSimilarity, searchSimilarity, globalEngagement, metadataSimilarity, isTopUp }) {
+function buildReasons({ playlistSimilarity, searchSimilarity, globalEngagement, isTopUp }) {
   if (isTopUp) return ["A popular pick to keep your playlist momentum going."];
-  if (metadataSimilarity >= playlistSimilarity && metadataSimilarity >= searchSimilarity) {
-    return ["Shares song context and related-artist traits with your playlist."];
-  }
   if (playlistSimilarity >= searchSimilarity && playlistSimilarity >= globalEngagement) {
     return ["Fits the vibe of songs already in your playlist."];
   }
@@ -99,13 +102,6 @@ function canonicalGeniusUrl(urlValue) {
   }
 }
 
-function normalizeTags(values) {
-  if (!Array.isArray(values)) return [];
-  return values
-    .map((value) => String(value || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-}
-
 function normalizeSeedText(value) {
   return String(value || "")
     .toLowerCase()
@@ -113,19 +109,6 @@ function normalizeSeedText(value) {
     .replace(/[^a-z0-9 ]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function computeMetadataSimilarity(candidateMeta, playlistTagSet, playlistRelatedArtistSet) {
-  if (!candidateMeta) return 0;
-  const tags = normalizeTags(candidateMeta.tags);
-  const relatedArtists = Array.isArray(candidateMeta.relatedArtistNames)
-    ? candidateMeta.relatedArtistNames.map((name) => String(name || "").toLowerCase().trim()).filter(Boolean)
-    : [];
-  const tagHits = tags.filter((tag) => playlistTagSet.has(tag)).length;
-  const artistHits = relatedArtists.filter((artist) => playlistRelatedArtistSet.has(artist)).length;
-  const tagScore = tags.length ? tagHits / tags.length : 0;
-  const artistScore = relatedArtists.length ? artistHits / relatedArtists.length : 0;
-  return Math.max(0, Math.min(1, 0.7 * tagScore + 0.3 * artistScore));
 }
 
 async function buildColdItems(limit = 5) {
@@ -143,7 +126,6 @@ async function buildColdItems(limit = 5) {
           playlistSimilarity: 0,
           searchSimilarity: 0,
           globalEngagement: computePopularSafeScore(statsDoc.data()),
-          metadataSimilarity: 0,
           isTopUp: true
         })
       };
@@ -201,22 +183,6 @@ exports.getRecommendations = onRequest({ cors: true, region: "us-central1", invo
     const searchScores = normalizeMap(searchRaw);
     const candidateIds = Array.from(new Set([...playlistScores.keys(), ...searchScores.keys()])).slice(0, 80);
 
-    const playlistSongDocs = await Promise.all(
-      Array.from(playlistTrackIds).map((id) => db.collection("songs").doc(id).get())
-    );
-    const playlistTagSet = new Set();
-    const playlistRelatedArtistSet = new Set();
-    playlistSongDocs.forEach((snap) => {
-      const meta = snap.exists ? snap.data()?.geniusMeta : null;
-      normalizeTags(meta?.tags).forEach((tag) => playlistTagSet.add(tag));
-      if (Array.isArray(meta?.relatedArtistNames)) {
-        meta.relatedArtistNames.forEach((name) => {
-          const normalized = String(name || "").toLowerCase().trim();
-          if (normalized) playlistRelatedArtistSet.add(normalized);
-        });
-      }
-    });
-
     if (candidateIds.length === 0) {
       const coldItems = await buildColdItems(5);
       res.json({ items: coldItems });
@@ -231,16 +197,15 @@ exports.getRecommendations = onRequest({ cors: true, region: "us-central1", invo
         ]);
         const stats = statsSnap.exists ? statsSnap.data() : {};
         const song = songSnap.exists ? songSnap.data() : {};
-        const metadataSimilarity = computeMetadataSimilarity(song?.geniusMeta, playlistTagSet, playlistRelatedArtistSet);
 
         const globalEngagement = computePopularSafeScore(stats);
         const playlistSimilarity = playlistScores.get(candidateId) || 0;
         const searchSimilarity = searchScores.get(candidateId) || 0;
         const recencyAffinity = playlistSimilarity * 0.8 + searchSimilarity * 0.2;
         const baseScore = scoreCandidate({ playlistSimilarity, searchSimilarity, globalEngagement, recencyAffinity });
-        const score = baseScore + 0.1 * metadataSimilarity;
+        const score = baseScore;
         const hasUsefulSignal =
-          playlistSimilarity >= 0.05 || searchSimilarity >= 0.05 || globalEngagement >= 0.1 || metadataSimilarity > 0;
+          playlistSimilarity >= 0.05 || searchSimilarity >= 0.05 || globalEngagement >= 0.1;
         if (!hasUsefulSignal) return null;
 
         return {
@@ -252,7 +217,6 @@ exports.getRecommendations = onRequest({ cors: true, region: "us-central1", invo
             playlistSimilarity,
             searchSimilarity,
             globalEngagement,
-            metadataSimilarity,
             isTopUp: false
           })
         };
@@ -276,7 +240,6 @@ exports.getRecommendations = onRequest({ cors: true, region: "us-central1", invo
             playlistSimilarity: 0,
             searchSimilarity: 0,
             globalEngagement: item.score,
-            metadataSimilarity: 0,
             isTopUp: true
           })
         }));
@@ -484,6 +447,83 @@ exports.getGeniusEnrichment = onRequest({ cors: true, region: "us-central1", inv
       relatedArtistNames: [],
       geniusSongId: null,
       geniusSongUrl: null
+    });
+  }
+});
+
+const SPOTIFY_ME_URL = "https://api.spotify.com/v1/me";
+
+/**
+ * Exchange a valid Spotify access token for a Firebase custom token.
+ * UID is stable per Spotify user: spotify_{spotifyUserId} (alphanumeric + underscore only).
+ */
+function parseJsonBody(req) {
+  const raw = req.body;
+  if (raw && typeof raw === "object" && !Buffer.isBuffer(raw)) {
+    return raw;
+  }
+  if (Buffer.isBuffer(raw)) {
+    try {
+      return JSON.parse(raw.toString("utf8"));
+    } catch (e) {
+      return null;
+    }
+  }
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
+
+const appspotSa = getAppspotServiceAccount();
+const createSpotifyAuthOptions = {
+  cors: true,
+  region: "us-central1",
+  invoker: "public",
+  ...(appspotSa ? { serviceAccount: appspotSa } : {})
+};
+
+exports.createSpotifyFirebaseSession = onRequest(createSpotifyAuthOptions, async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const body = parseJsonBody(req) || {};
+    const accessToken = body.accessToken;
+    if (!accessToken || typeof accessToken !== "string") {
+      res.status(400).json({ error: "accessToken is required" });
+      return;
+    }
+    const meRes = await fetch(SPOTIFY_ME_URL, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    if (!meRes.ok) {
+      logger.warn("createSpotifyFirebaseSession: Spotify /me failed", { status: meRes.status });
+      res.status(401).json({ error: "Invalid or expired Spotify access token" });
+      return;
+    }
+    const me = await meRes.json();
+    const spotifyId = me?.id ? String(me.id) : "";
+    if (!spotifyId) {
+      res.status(400).json({ error: "Spotify profile had no id" });
+      return;
+    }
+    const safeId = spotifyId.replace(/[^a-zA-Z0-9]/g, "_");
+    const uid = `spotify_${safeId}`;
+    // Avoid reserved / ambiguous claim keys; keep payload small.
+    const customToken = await admin.auth().createCustomToken(uid, { spotifyUserId: spotifyId });
+    res.status(200).json({ customToken, uid });
+  } catch (error) {
+    const message = error && typeof error === "object" && "message" in error ? String(error.message) : String(error);
+    logger.error("createSpotifyFirebaseSession failed", error);
+    res.status(500).json({
+      error: "Failed to create session",
+      detail: message
     });
   }
 });
