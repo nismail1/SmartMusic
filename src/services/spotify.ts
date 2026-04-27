@@ -35,6 +35,7 @@ const supplementalTagsCache = new Map<string, string[]>();
 const supplementalTagsInFlight = new Map<string, Promise<string[]>>();
 const searchTracksCache = new Map<string, { expiresAt: number; results: SpotifyTrack[] }>();
 const searchTracksInFlight = new Map<string, Promise<SpotifyTrack[]>>();
+const listCurrentUserPlaylistsInFlight = new Map<string, Promise<SpotifyUserPlaylist[]>>();
 let searchCooldownUntil = 0;
 const spotifyCooldowns = new Map<string, number>();
 let supplementalQueue = Promise.resolve<void>(undefined);
@@ -129,6 +130,13 @@ function setSpotifyCooldown(key: string, retryAfterHeader: string | null): numbe
   const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
   spotifyCooldowns.set(key, Date.now() + retryAfterMs);
   return retryAfterMs;
+}
+
+/** After repeated 5xx failures, back off so we do not hammer Spotify while their gateway is unhealthy. */
+function setTransientSpotifyFailureCooldown(key: string, ms: number) {
+  const until = Date.now() + Math.max(2_000, ms);
+  const prev = spotifyCooldowns.get(key) ?? 0;
+  spotifyCooldowns.set(key, Math.max(until, prev));
 }
 
 function parseRetryAfterMs(retryAfterHeader: string | null): number {
@@ -409,91 +417,109 @@ export const spotifyService = {
   },
 
   async listCurrentUserPlaylists(accessToken: string): Promise<SpotifyUserPlaylist[]> {
-    const cooldownKey = "me_playlists";
-    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
-    if (cooldownRemainingMs > 0) {
-      throw new Error(`Spotify playlists are cooling down after rate-limit. Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`);
-    }
-    const items: SpotifyUserPlaylist[] = [];
-    let nextUrl: string | null = "https://api.spotify.com/v1/me/playlists?limit=50";
-    while (nextUrl) {
-      const maxAttempts = 3;
-      let response: Response | null = null;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        response = await fetch(nextUrl, {
-          headers: { Authorization: `Bearer ${accessToken}` }
-        });
-        if (response.status === 429) {
-          const retryAfterMs = setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
-          if (attempt < maxAttempts) {
-            await sleep(retryAfterMs + Math.floor(Math.random() * 250));
-            continue;
-          }
-        }
-        if (response.ok) break;
-        const transient = [502, 503, 504].includes(response.status);
-        if (transient && attempt < maxAttempts) {
-          // #region agent log
-          import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
-            body: JSON.stringify({
-              sessionId: "658713",
-              runId: "spotify-playlist-retry",
-              hypothesisId: "H4",
-              location: "src/services/spotify.ts:listCurrentUserPlaylists",
-              message: "transient spotify error, retrying",
-              data: { status: response.status, attempt, nextUrl: nextUrl.slice(0, 60) },
-              timestamp: Date.now()
-            })
-          }).catch(() => {});
-          // #endregion
-          await new Promise((r) => setTimeout(r, 400 * attempt));
-          continue;
-        }
-        break;
-      }
-      if (!response || !response.ok) {
+    const inFlightKey = accessToken;
+    const existing = listCurrentUserPlaylistsInFlight.get(inFlightKey);
+    if (existing) return existing;
+
+    const task = (async () => {
+      const cooldownKey = "me_playlists";
+      const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+      if (cooldownRemainingMs > 0) {
         throw new Error(
-          "Failed to load Spotify playlists. If Spotify is busy, try again in a few seconds."
+          `Spotify playlists are cooling down (recent errors or rate limits). Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`
         );
       }
-      const payload: any = await response.json();
-      debugLog(
-        "src/services/spotify.ts:listCurrentUserPlaylists",
-        "spotify me playlists page fetched",
-        {
-          status: response.status,
-          itemCount: Array.isArray(payload?.items) ? payload.items.length : 0,
-          sample: Array.isArray(payload?.items) && payload.items[0]
-            ? {
-                id: payload.items[0].id ?? null,
-                ownerId: payload.items[0]?.owner?.id ?? null,
-                public: payload.items[0]?.public ?? null,
-                collaborative: payload.items[0]?.collaborative ?? null,
-                tracksTotal: payload.items[0]?.tracks?.total ?? null,
-                hasTracksHref: Boolean(payload.items[0]?.tracks?.href)
-              }
-            : null
-        },
-        "M60"
-      );
-      const pageItems = Array.isArray(payload?.items) ? payload.items : [];
-      items.push(
-        ...pageItems.map((playlist: any) => ({
-          id: String(playlist?.id ?? ""),
-          name: String(playlist?.name ?? "Untitled Spotify playlist"),
-          trackCount: Number(playlist?.tracks?.total ?? 0),
-          public: typeof playlist?.public === "boolean" ? playlist.public : null,
-          collaborative: Boolean(playlist?.collaborative),
-          ownerId: playlist?.owner?.id ? String(playlist.owner.id) : null,
-          tracksHref: playlist?.tracks?.href ? String(playlist.tracks.href) : null,
-          itemsHref: playlist?.items?.href ? String(playlist.items.href) : null
-        }))
-      );
-      nextUrl = payload?.next ? String(payload.next) : null;
+      const items: SpotifyUserPlaylist[] = [];
+      let nextUrl: string | null = "https://api.spotify.com/v1/me/playlists?limit=50";
+      while (nextUrl) {
+        const maxAttempts = 3;
+        let response: Response | null = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          response = await fetch(nextUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` }
+          });
+          if (response.status === 429) {
+            const retryAfterMs = setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+            if (attempt < maxAttempts) {
+              await sleep(retryAfterMs + Math.floor(Math.random() * 250));
+              continue;
+            }
+          }
+          if (response.ok) break;
+          const transient = [502, 503, 504].includes(response.status);
+          if (transient && attempt < maxAttempts) {
+            import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
+              body: JSON.stringify({
+                sessionId: "658713",
+                runId: "spotify-playlist-retry",
+                hypothesisId: "H4",
+                location: "src/services/spotify.ts:listCurrentUserPlaylists",
+                message: "transient spotify error, retrying",
+                data: { status: response.status, attempt, nextUrl: nextUrl.slice(0, 60) },
+                timestamp: Date.now()
+              })
+            }).catch(() => {});
+            const backoff = Math.min(10_000, 700 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500));
+            await sleep(backoff);
+            continue;
+          }
+          break;
+        }
+        if (!response || !response.ok) {
+          const status = response?.status ?? 0;
+          if ([502, 503, 504].includes(status) || status === 429) {
+            setTransientSpotifyFailureCooldown(cooldownKey, 8_000);
+          }
+          throw new Error(
+            "Failed to load Spotify playlists. If Spotify is busy, try again in a few seconds."
+          );
+        }
+        const payload: any = await response.json();
+        debugLog(
+          "src/services/spotify.ts:listCurrentUserPlaylists",
+          "spotify me playlists page fetched",
+          {
+            status: response.status,
+            itemCount: Array.isArray(payload?.items) ? payload.items.length : 0,
+            sample: Array.isArray(payload?.items) && payload.items[0]
+              ? {
+                  id: payload.items[0].id ?? null,
+                  ownerId: payload.items[0]?.owner?.id ?? null,
+                  public: payload.items[0]?.public ?? null,
+                  collaborative: payload.items[0]?.collaborative ?? null,
+                  tracksTotal: payload.items[0]?.tracks?.total ?? null,
+                  hasTracksHref: Boolean(payload.items[0]?.tracks?.href)
+                }
+              : null
+          },
+          "M60"
+        );
+        const pageItems = Array.isArray(payload?.items) ? payload.items : [];
+        items.push(
+          ...pageItems.map((playlist: any) => ({
+            id: String(playlist?.id ?? ""),
+            name: String(playlist?.name ?? "Untitled Spotify playlist"),
+            trackCount: Number(playlist?.tracks?.total ?? 0),
+            public: typeof playlist?.public === "boolean" ? playlist.public : null,
+            collaborative: Boolean(playlist?.collaborative),
+            ownerId: playlist?.owner?.id ? String(playlist.owner.id) : null,
+            tracksHref: playlist?.tracks?.href ? String(playlist.tracks.href) : null,
+            itemsHref: playlist?.items?.href ? String(playlist.items.href) : null
+          }))
+        );
+        nextUrl = payload?.next ? String(payload.next) : null;
+      }
+      return items.filter((playlist) => Boolean(playlist.id));
+    })();
+
+    listCurrentUserPlaylistsInFlight.set(inFlightKey, task);
+    try {
+      return await task;
+    } finally {
+      listCurrentUserPlaylistsInFlight.delete(inFlightKey);
     }
-    return items.filter((playlist) => Boolean(playlist.id));
   },
 
   async listSpotifyPlaylistTracks(

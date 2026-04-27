@@ -1,4 +1,4 @@
-import type { RecommendationItem, PlaylistTrack } from "../types/music";
+import type { RecommendationItem, PlaylistTrack, SpotifyTrack } from "../types/music";
 import {
   collection,
   doc,
@@ -51,6 +51,8 @@ interface PlaylistSuggestionCacheDoc {
   primarySuggestion: RecommendationItem | null;
   fetchedAt: number;
   expiresAt: number;
+  /** When `"api"`, co-occurrence must ignore this doc and rebuild; API path may reuse hydrated rows. */
+  suggestionSource?: "cooc" | "api";
 }
 
 const TTL_MS = {
@@ -355,6 +357,118 @@ interface RecommendationOptions {
 
 const recommendationsInFlight = new Map<string, Promise<RecommendationItem[]>>();
 
+async function loadPlaylistTrackIds(playlistId: string): Promise<string[]> {
+  const tracksSnap = await getDocs(collection(db, "playlists", playlistId, "tracks"));
+  return tracksSnap.docs
+    .map((docSnap) => {
+      const data = docSnap.data() as Partial<PlaylistTrack>;
+      return String(data.id ?? docSnap.id);
+    })
+    .filter(Boolean);
+}
+
+function buildSuggestionCacheKey(
+  playlistId: string,
+  playlistTrackIds: string[],
+  excludeSongIds: string[] | undefined
+): { cacheKey: string; excludedHash: string } {
+  const excludedIds = new Set(playlistTrackIds);
+  for (const id of excludeSongIds ?? []) {
+    if (id) excludedIds.add(id);
+  }
+  const excludedHash = hashString(Array.from(excludedIds).sort().join("|"));
+  const cacheKey = `${playlistId}_${playlistTrackHash(playlistTrackIds)}_${excludedHash}`;
+  return { cacheKey, excludedHash };
+}
+
+function recommendationItemLooksSpotifyHydrated(item: RecommendationItem | undefined): boolean {
+  if (!item) return false;
+  if (Number(item.durationMs) > 0) return true;
+  if (item.releaseDate && String(item.releaseDate).trim()) return true;
+  if (item.previewUrl) return true;
+  if (item.albumName && String(item.albumName).trim()) return true;
+  return false;
+}
+
+function mergeSpotifyTrackIntoRecommendation(item: RecommendationItem, track: SpotifyTrack): RecommendationItem {
+  return {
+    ...item,
+    spotifyId: item.spotifyId ?? track.id,
+    songName: item.songName && item.songName !== item.songId ? item.songName : track.name,
+    artists: item.artists?.length ? item.artists : track.artists,
+    uri: item.uri || track.uri,
+    albumName: item.albumName || track.albumName,
+    artworkUrl: item.artworkUrl ?? track.artworkUrl,
+    previewUrl: item.previewUrl ?? track.previewUrl,
+    releaseDate: item.releaseDate ?? track.releaseDate,
+    durationMs: item.durationMs && item.durationMs > 0 ? item.durationMs : track.durationMs
+  };
+}
+
+/** After Cloud Function returns thin items: batch `getTracksByIds`, merge, persist to `playlist_suggestion_cache`. */
+async function hydrateApiRecommendationsFromSpotify(
+  playlistId: string,
+  fromApi: RecommendationItem[],
+  options?: RecommendationOptions
+): Promise<RecommendationItem[]> {
+  if (!fromApi.length) return [];
+  const playlistTrackIds = await loadPlaylistTrackIds(playlistId);
+  const { cacheKey, excludedHash } = buildSuggestionCacheKey(playlistId, playlistTrackIds, options?.excludeSongIds);
+
+  if (!options?.forceRefresh) {
+    const cached = await getCacheDoc<PlaylistSuggestionCacheDoc>("playlist_suggestion_cache", cacheKey);
+    if (
+      cached?.suggestions?.length &&
+      cached.suggestions[0]?.songId === fromApi[0]?.songId &&
+      recommendationItemLooksSpotifyHydrated(cached.suggestions[0])
+    ) {
+      debugLog(
+        "src/services/recommendations.ts:hydrateApiRecommendationsFromSpotify",
+        "served hydrated suggestions from playlist_suggestion_cache",
+        { cacheKey, songId: fromApi[0].songId, source: cached.suggestionSource ?? "legacy" },
+        "H50",
+        "metadata-genre-debug"
+      );
+      return cached.suggestions.slice(0, RETURN_SUGGESTIONS);
+    }
+  }
+
+  const toHydrate = fromApi.slice(0, Math.max(RETURN_SUGGESTIONS, 5));
+  const ids = toHydrate.map((i) => i.songId).filter(Boolean);
+  const tracks = await spotifyService.getTracksByIds(ids);
+  const byId = new Map(tracks.map((t) => [t.id, t]));
+  const merged = toHydrate.map((item) => {
+    const t = byId.get(item.songId);
+    return t ? mergeSpotifyTrackIntoRecommendation(item, t) : item;
+  });
+  const out = merged.slice(0, RETURN_SUGGESTIONS);
+
+  await setCacheDoc("playlist_suggestion_cache", cacheKey, {
+    playlistId,
+    playlistTrackHash: playlistTrackHash(playlistTrackIds),
+    excludedHash,
+    suggestionSource: "api",
+    suggestions: merged,
+    primarySuggestion: out[0] ?? null,
+    fetchedAt: nowMs(),
+    expiresAt: nowMs() + TTL_MS.finalSuggestion
+  });
+  debugLog(
+    "src/services/recommendations.ts:hydrateApiRecommendationsFromSpotify",
+    "merged Spotify metadata into API items and cached",
+    {
+      cacheKey,
+      outCount: out.length,
+      sample: out[0]
+        ? { songId: out[0].songId, releaseDate: out[0].releaseDate ?? null, durationMs: out[0].durationMs ?? null }
+        : null
+    },
+    "H51",
+    "metadata-genre-debug"
+  );
+  return out;
+}
+
 async function buildCooccurrenceRecommendations(playlistId: string, options?: RecommendationOptions): Promise<RecommendationItem[]> {
   const tracksSnap = await getDocs(collection(db, "playlists", playlistId, "tracks"));
   const playlistTracks = tracksSnap.docs.map((docSnap) => {
@@ -391,7 +505,7 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
     "suppression-debug"
   );
   const suggestionCache = await getCacheDoc<PlaylistSuggestionCacheDoc>("playlist_suggestion_cache", cacheKey);
-  if (!options?.forceRefresh && suggestionCache?.suggestions?.length) {
+  if (!options?.forceRefresh && suggestionCache?.suggestions?.length && suggestionCache.suggestionSource !== "api") {
     debugLog(
       "src/services/recommendations.ts:buildCooccurrenceRecommendations",
       "served suggestions from cache",
@@ -571,6 +685,7 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
     playlistId,
     playlistTrackHash: playlistTrackHash(playlistTrackIds),
     excludedHash,
+    suggestionSource: "cooc",
     suggestions: finalSuggestions,
     primarySuggestion: finalSuggestions[0] ?? null,
     fetchedAt: nowMs(),
@@ -650,14 +765,7 @@ export const recommendationService = {
           "H3"
         );
         if (filteredFromApi.length >= RETURN_SUGGESTIONS) {
-          debugLog(
-            "src/services/recommendations.ts:getRecommendations",
-            "using raw api suggestions without client hydration",
-            { count: filteredFromApi.length },
-            "H39",
-            "metadata-genre-debug"
-          );
-          return filteredFromApi.slice(0, RETURN_SUGGESTIONS);
+          return hydrateApiRecommendationsFromSpotify(playlistId, filteredFromApi, options);
         }
         const fallback = await buildCooccurrenceRecommendations(playlistId, options);
         const filteredFallback = fallback.filter((item) => !excludedIds.has(item.songId));
