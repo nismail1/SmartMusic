@@ -29,3 +29,6 @@ ui-debug.log*
 .DS_Store
 .idea/
 .vscode/
+.env
+.env.local
+.env.*
