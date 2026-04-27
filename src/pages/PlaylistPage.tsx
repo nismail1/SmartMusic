@@ -62,7 +62,7 @@ export function PlaylistPage() {
     const missingReleaseCount = recommendations.filter((item) => !item.releaseDate).length;
     const missingDurationCount = recommendations.filter((item) => !Number(item.durationMs ?? 0)).length;
     // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
       body: JSON.stringify({
@@ -127,7 +127,7 @@ export function PlaylistPage() {
       setRecommendationError("");
     } catch (error) {
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -227,7 +227,7 @@ export function PlaylistPage() {
         genres: []
       };
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -296,7 +296,7 @@ export function PlaylistPage() {
   async function handleSuggestionPlay(item: RecommendationItem) {
     try {
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -348,7 +348,7 @@ export function PlaylistPage() {
         index: recommendations.findIndex((rec) => rec.songId === item.songId)
       });
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -372,7 +372,7 @@ export function PlaylistPage() {
       // #endregion
     } catch {
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -431,7 +431,7 @@ export function PlaylistPage() {
     const dismissedId = item.songId;
     const nextSuppressed = Array.from(new Set([...suppressedSuggestionIds, dismissedId]));
     // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
       body: JSON.stringify({
@@ -457,7 +457,7 @@ export function PlaylistPage() {
       setRecommendationError("");
     } catch (error) {
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({

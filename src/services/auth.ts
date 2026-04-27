@@ -23,7 +23,7 @@ function debugLog(
   runId = "spotify-auth-debug"
 ) {
   // #region agent log
-  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+  import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
     body: JSON.stringify({

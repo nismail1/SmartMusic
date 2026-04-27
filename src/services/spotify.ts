@@ -14,7 +14,7 @@ function debugLog(
   runId = "spotify-api-debug"
 ) {
   // #region agent log
-  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+  import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
     body: JSON.stringify({
@@ -36,6 +36,7 @@ const supplementalTagsInFlight = new Map<string, Promise<string[]>>();
 const searchTracksCache = new Map<string, { expiresAt: number; results: SpotifyTrack[] }>();
 const searchTracksInFlight = new Map<string, Promise<SpotifyTrack[]>>();
 let searchCooldownUntil = 0;
+const spotifyCooldowns = new Map<string, number>();
 let supplementalQueue = Promise.resolve<void>(undefined);
 let supplementalCooldownUntil = 0;
 const SEARCH_TRACKS_TTL_MS = 10 * 60 * 1000;
@@ -118,6 +119,28 @@ async function fetchWithSpotifyRetry(url: string, token: string, init?: RequestI
   throw new Error("Spotify request exhausted retries.");
 }
 
+function getSpotifyCooldownKey(url: string): string {
+  if (url.includes("/v1/search")) return "search";
+  if (url.includes("/v1/tracks")) return "tracks";
+  if (url.includes("/v1/artists")) return "artists";
+  if (url.includes("/v1/me/playlists")) return "me_playlists";
+  if (url.includes("/v1/playlists")) return "playlists";
+  if (url.includes("/v1/me")) return "me";
+  return "spotify_generic";
+}
+
+function getCooldownRemainingMs(key: string): number {
+  const until = spotifyCooldowns.get(key) ?? 0;
+  const now = Date.now();
+  return until > now ? until - now : 0;
+}
+
+function setSpotifyCooldown(key: string, retryAfterHeader: string | null): number {
+  const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+  spotifyCooldowns.set(key, Date.now() + retryAfterMs);
+  return retryAfterMs;
+}
+
 function parseRetryAfterMs(retryAfterHeader: string | null): number {
   if (!retryAfterHeader) return 1000;
   const numeric = Number(retryAfterHeader);
@@ -172,11 +195,13 @@ export const spotifyService = {
     const normalizedQuery = query.trim();
     if (!normalizedQuery) return [];
     const cacheKey = `${market}:${normalizedQuery.toLowerCase()}`;
+    const cooldownKey = "search";
     const now = Date.now();
-    if (searchCooldownUntil > now) {
-      const waitMs = searchCooldownUntil - now;
+    const globalCooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (searchCooldownUntil > now || globalCooldownRemainingMs > 0) {
+      const waitMs = Math.max(searchCooldownUntil - now, globalCooldownRemainingMs);
       // #region agent log
-      fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+      import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
         body: JSON.stringify({
@@ -194,7 +219,7 @@ export const spotifyService = {
     }
     const cached = searchTracksCache.get(cacheKey);
     // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
       body: JSON.stringify({
@@ -217,7 +242,7 @@ export const spotifyService = {
     const task = (async () => {
     const token = accessToken?.trim() ? accessToken.trim() : await getToken();
     // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
       body: JSON.stringify({
@@ -240,10 +265,10 @@ export const spotifyService = {
     const res = await fetchWithSpotifyRetry(`${SPOTIFY_SEARCH_URL}?${params.toString()}`, token);
     if (!res.ok) {
       if (res.status === 429) {
-        const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+        const retryAfterMs = setSpotifyCooldown(cooldownKey, res.headers.get("retry-after"));
         searchCooldownUntil = Date.now() + retryAfterMs;
         // #region agent log
-        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
           body: JSON.stringify({
@@ -371,9 +396,17 @@ export const spotifyService = {
   },
 
   async getCurrentUserProfile(accessToken: string): Promise<SpotifyUserProfile> {
+    const cooldownKey = "me";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) {
+      throw new Error(`Spotify profile is cooling down after rate-limit. Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`);
+    }
     const res = await fetch("https://api.spotify.com/v1/me", {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
+    if (res.status === 429) {
+      setSpotifyCooldown(cooldownKey, res.headers.get("retry-after"));
+    }
     if (!res.ok) {
       throw new Error("Failed to load Spotify profile.");
     }
@@ -386,6 +419,11 @@ export const spotifyService = {
   },
 
   async listCurrentUserPlaylists(accessToken: string): Promise<SpotifyUserPlaylist[]> {
+    const cooldownKey = "me_playlists";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) {
+      throw new Error(`Spotify playlists are cooling down after rate-limit. Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`);
+    }
     const items: SpotifyUserPlaylist[] = [];
     let nextUrl: string | null = "https://api.spotify.com/v1/me/playlists?limit=50";
     while (nextUrl) {
@@ -395,11 +433,18 @@ export const spotifyService = {
         response = await fetch(nextUrl, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
+        if (response.status === 429) {
+          const retryAfterMs = setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+          if (attempt < maxAttempts) {
+            await sleep(retryAfterMs + Math.floor(Math.random() * 250));
+            continue;
+          }
+        }
         if (response.ok) break;
         const transient = [502, 503, 504].includes(response.status);
         if (transient && attempt < maxAttempts) {
           // #region agent log
-          fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+          import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
             body: JSON.stringify({
@@ -467,6 +512,11 @@ export const spotifyService = {
     tracksHref?: string | null,
     itemsHref?: string | null
   ): Promise<SpotifyTrack[]> {
+    const cooldownKey = "playlists";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) {
+      throw new Error(`Spotify playlist endpoints are cooling down after rate-limit. Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s.`);
+    }
     const tracks: SpotifyTrack[] = [];
     let hadForbiddenTracksResponse = false;
     debugLog(
@@ -530,6 +580,9 @@ export const spotifyService = {
       const response: Response = await fetch(nextUrl, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
+      if (response.status === 429) {
+        setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+      }
       if (!response.ok) {
         hadForbiddenTracksResponse = response.status === 403;
         let bodyText = "";
@@ -554,6 +607,9 @@ export const spotifyService = {
         const legacyTracksResponse = await fetch(legacyTracksUrl, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
+        if (legacyTracksResponse.status === 429) {
+          setSpotifyCooldown(cooldownKey, legacyTracksResponse.headers.get("retry-after"));
+        }
         if (legacyTracksResponse.ok) {
           const legacyPayload: any = await legacyTracksResponse.json();
           const legacyItems = Array.isArray(legacyPayload?.items) ? legacyPayload.items : [];
@@ -574,6 +630,9 @@ export const spotifyService = {
         const fallbackResponse = await fetch(fallbackUrl, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
+        if (fallbackResponse.status === 429) {
+          setSpotifyCooldown(cooldownKey, fallbackResponse.headers.get("retry-after"));
+        }
         if (!fallbackResponse.ok) {
           let fallbackBody = "";
           try {
@@ -637,6 +696,9 @@ export const spotifyService = {
   async searchPublicPlaylists(query: string, limit = 12): Promise<SpotifyPublicPlaylist[]> {
     const normalized = query.trim();
     if (!normalized) return [];
+    const cooldownKey = "search";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) return [];
     const token = await getToken();
     const params = new URLSearchParams({
       q: normalized,
@@ -645,6 +707,9 @@ export const spotifyService = {
       limit: String(Math.max(1, Math.min(50, limit)))
     });
     const response = await fetchWithSpotifyRetry(`${SPOTIFY_SEARCH_URL}?${params.toString()}`, token);
+    if (response.status === 429) {
+      setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+    }
     if (!response.ok) {
       throw new Error(`Spotify public playlist search failed (${response.status}).`);
     }
@@ -662,11 +727,17 @@ export const spotifyService = {
 
   async getPublicPlaylistTracks(playlistId: string, limit = 120): Promise<SpotifyTrack[]> {
     if (!playlistId) return [];
+    const cooldownKey = "playlists";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) return [];
     const token = await getToken();
     const tracks: SpotifyTrack[] = [];
     let nextUrl: string | null = `${SPOTIFY_PLAYLISTS_URL}/${encodeURIComponent(playlistId)}/items?limit=100`;
     while (nextUrl && tracks.length < limit) {
       const response = await fetchWithSpotifyRetry(nextUrl, token);
+      if (response.status === 429) {
+        setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+      }
       if (!response.ok) {
         throw new Error(`Spotify playlist tracks fetch failed (${response.status}).`);
       }
@@ -687,6 +758,18 @@ export const spotifyService = {
       { requestedCount: uniqueIds.length, sampleIds: uniqueIds.slice(0, 3) },
       "H7"
     );
+    const cooldownKey = "tracks";
+    const cooldownRemainingMs = getCooldownRemainingMs(cooldownKey);
+    if (cooldownRemainingMs > 0) {
+      debugLog(
+        "src/services/spotify.ts:getTracksByIds",
+        "track lookup skipped due cooldown",
+        { waitMs: cooldownRemainingMs, requestedCount: uniqueIds.length },
+        "H49",
+        "search-token-debug"
+      );
+      return [];
+    }
     const token = await getToken();
     const batches: string[][] = [];
     for (let i = 0; i < uniqueIds.length; i += 50) {
@@ -696,6 +779,9 @@ export const spotifyService = {
     for (const batch of batches) {
       const params = new URLSearchParams({ ids: batch.join(",") });
       const response = await fetchWithSpotifyRetry(`${SPOTIFY_TRACKS_URL}?${params.toString()}`, token);
+      if (response.status === 429) {
+        setSpotifyCooldown(cooldownKey, response.headers.get("retry-after"));
+      }
       if (!response.ok) {
         let bodyPreview = "";
         try {

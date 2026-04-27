@@ -9,7 +9,7 @@ coverage/
 # Local environment files
 
 
-!.env.example
+.env.example
 
 # Logs
 npm-debug.log*

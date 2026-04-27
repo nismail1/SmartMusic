@@ -29,7 +29,7 @@ function hasRequiredPlaybackScopes(scope?: string | null): boolean {
 
 function debugLog(location: string, message: string, data: Record<string, unknown>, hypothesisId: string, runId = "playback-debug") {
   // #region agent log
-  fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+  import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
     body: JSON.stringify({
@@ -213,7 +213,7 @@ class PlaybackController {
   async stop(spotifyAccessToken?: string | null) {
     const mode = this.state.mode;
     // #region agent log
-    fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+    import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
       body: JSON.stringify({
@@ -236,7 +236,7 @@ class PlaybackController {
       try {
         await this.spotifyPlayer.pause();
         // #region agent log
-        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
           body: JSON.stringify({
@@ -266,7 +266,7 @@ class PlaybackController {
           headers: { Authorization: `Bearer ${spotifyAccessToken}` }
         });
         // #region agent log
-        fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
+        import.meta.env.DEV && fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "658713" },
           body: JSON.stringify({
