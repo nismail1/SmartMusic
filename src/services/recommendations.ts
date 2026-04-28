@@ -172,6 +172,13 @@ function buildReason(
   return `Picked because it repeatedly appears in public playlists related to your current tracks (${cooccurCount} co-occurrence hits).`;
 }
 
+/** Shown when the LLM endpoint misbehaves; keep listener-facing, not algorithmic. */
+const SUGGESTION_REASON_ENJOY_FALLBACK =
+  "Could be a fun next listen — it sits in a similar pocket to the stuff you’ve already got in this playlist.";
+
+const SUGGESTION_REASON_LLM_INSTRUCTION =
+  "Write exactly 1–2 short sentences an actual human would enjoy reading in a music app. Focus on why someone might *love listening* to this suggestion next — mood, energy, artist vibe, or how it fits emotionally with their taste. Be warm and a little playful; skip dry or corporate tone. Do not mention rankings, scores, statistics, algorithms, co-occurrence, playlists of strangers, or how the app picked the track.";
+
 async function refineReasonWithLLM(
   baseReason: string,
   context: {
@@ -179,7 +186,7 @@ async function refineReasonWithLLM(
     artists: string[];
     seedTrackNames: string[];
     playlistTrackNames?: string[];
-    scoreBreakdown?: RecommendationItem["scoreBreakdown"];
+    albumName?: string;
   }
 ): Promise<string> {
   const explicitEndpoint = (import.meta.env.VITE_REASON_LLM_ENDPOINT ?? "").trim();
@@ -196,18 +203,17 @@ async function refineReasonWithLLM(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        instruction:
-          "Write 1-2 specific sentences about why this track fits the playlist overall. Use provided playlist + cooccurrence evidence only. Do not invent facts.",
+        instruction: SUGGESTION_REASON_LLM_INSTRUCTION,
         baseReason,
         context
       })
     });
-    if (!response.ok) return `${baseReason} (LLM reason request failed: ${response.status})`;
+    if (!response.ok) return SUGGESTION_REASON_ENJOY_FALLBACK;
     const payload = (await response.json()) as { reason?: string };
     const candidate = String(payload.reason ?? "").trim();
-    return candidate || `${baseReason} (LLM returned empty reason)`;
+    return candidate || SUGGESTION_REASON_ENJOY_FALLBACK;
   } catch {
-    return `${baseReason} (LLM reason request threw an error)`;
+    return SUGGESTION_REASON_ENJOY_FALLBACK;
   }
 }
 
@@ -219,8 +225,37 @@ async function getCacheDoc<T extends { expiresAt: number }>(pathCollection: stri
   return data;
 }
 
+/** Firestore rejects `undefined` at any depth; only omit keys (or use `null` where a sentinel is required). */
+function stripUndefinedForFirestore<T extends object>(payload: T): T {
+  return stripPlainPayload(payload) as T;
+}
+
+function stripPlainPayload(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "object") return value;
+  if (value instanceof Date) return value;
+  if (Array.isArray(value)) {
+    return value.map(stripPlainPayload).filter((v) => v !== undefined);
+  }
+  const proto = Object.getPrototypeOf(value as object);
+  if (proto !== Object.prototype && proto !== null) {
+    return value;
+  }
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(value as Record<string, unknown>)) {
+    const v = (value as Record<string, unknown>)[k];
+    if (v === undefined) continue;
+    const s = stripPlainPayload(v);
+    if (s === undefined) continue;
+    out[k] = s;
+  }
+  return out;
+}
+
 async function setCacheDoc(pathCollection: string, key: string, payload: object): Promise<void> {
-  await setDoc(doc(db, pathCollection, key), payload, { merge: true });
+  const safe = stripUndefinedForFirestore(payload);
+  await setDoc(doc(db, pathCollection, key), safe, { merge: true });
 }
 
 async function getOrBuildSearchCache(normalized: string): Promise<string[]> {
@@ -396,12 +431,15 @@ function mergeSpotifyTrackIntoRecommendation(item: RecommendationItem, track: Sp
     spotifyId: item.spotifyId ?? track.id,
     songName: item.songName && item.songName !== item.songId ? item.songName : track.name,
     artists: item.artists?.length ? item.artists : track.artists,
+    spotifyArtistIds: track.spotifyArtistIds,
     uri: item.uri || track.uri,
     albumName: item.albumName || track.albumName,
     artworkUrl: item.artworkUrl ?? track.artworkUrl,
     previewUrl: item.previewUrl ?? track.previewUrl,
     releaseDate: item.releaseDate ?? track.releaseDate,
-    durationMs: item.durationMs && item.durationMs > 0 ? item.durationMs : track.durationMs
+    durationMs: item.durationMs && item.durationMs > 0 ? item.durationMs : track.durationMs,
+    genres: track.genres,
+    genresFetchedAt: track.genresFetchedAt
   };
 }
 
@@ -545,6 +583,10 @@ async function hydrateApiRecommendationsFromSpotify(
       expiresAt: nowMs() + TTL_MS.finalSuggestion
     });
   } catch (cacheWriteErr) {
+    console.error(
+      "[hydrateApiRecommendationsFromSpotify] playlist_suggestion_cache setDoc failed:",
+      cacheWriteErr
+    );
     // #region agent log
     fetch("http://127.0.0.1:7701/ingest/35369d23-7f37-4585-ac9a-076a3915746b", {
       method: "POST",
@@ -770,7 +812,7 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
       artists: first.artists ?? [],
       seedTrackNames: seedTracks.map((track) => track.name).slice(0, 5),
       playlistTrackNames: playlistTracks.map((track) => track.name).slice(0, 12),
-      scoreBreakdown: first.scoreBreakdown
+      albumName: first.albumName
     });
     first.reasons = [refined];
   }

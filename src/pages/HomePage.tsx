@@ -218,12 +218,13 @@ export function HomePage() {
         { sourcePlaylistId: sourcePlaylist.id, sourcePlaylistName: sourcePlaylist.name, ownerId },
         "M32"
       );
-      const tracks = await spotifyService.listSpotifyPlaylistTracks(
+      const rawTracks = await spotifyService.listSpotifyPlaylistTracks(
         spotifySession.accessToken,
         sourcePlaylist.id,
         sourcePlaylist.tracksHref,
         sourcePlaylist.itemsHref
       );
+      const tracks = await spotifyService.enrichTracksBatchedForGenres(rawTracks);
       if (sourcePlaylist.trackCount > 0 && tracks.length === 0) {
         const message =
           "Spotify returned this playlist but did not permit reading its track items for this app/token. Try another playlist.";

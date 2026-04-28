@@ -39,5 +39,6 @@ describe("computePlaylistAnalytics", () => {
     expect(result.decadeBreakdown["1990s"]).toBe(1);
     expect(result.genreComposition.pop).toBe(1);
     expect(result.genreComposition.rock).toBe(1);
+    expect(result.topArtists.map((t) => t.name)).toEqual(expect.arrayContaining(["Artist A", "Artist B"]));
   });
 });

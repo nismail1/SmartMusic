@@ -13,7 +13,8 @@ import {
   where
 } from "firebase/firestore";
 import { db } from "./firebase";
-import type { Playlist, PlaylistTrack, SpotifyTrack } from "../types/music";
+import type { Playlist, PlaylistLlmGenresCache, PlaylistTrack, SpotifyTrack } from "../types/music";
+import { spotifyService } from "./spotify";
 
 const playlistsCol = collection(db, "playlists");
 
@@ -33,6 +34,17 @@ function debugLog(location: string, message: string, data: Record<string, unknow
     })
   }).catch(() => {});
   // #endregion
+}
+
+/** Stable hash of the playlist's track id set (order-independent). */
+export function computePlaylistTrackContentHash(trackIds: string[]): string {
+  let hash = 2166136261;
+  const s = [...new Set(trackIds.map((id) => String(id).trim()).filter(Boolean))].sort().join("|");
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return Math.abs(hash >>> 0).toString(16);
 }
 
 function isSyntheticGenreTag(tag: string): boolean {
@@ -127,12 +139,40 @@ export const playlistService = {
       updatedAt: data.updatedAt?.toDate?.()?.toISOString?.() ?? new Date().toISOString()
     };
   },
+
+  async getPlaylistLlmGenresCache(playlistId: string): Promise<PlaylistLlmGenresCache | null> {
+    const snap = await getDoc(doc(db, "playlists", playlistId));
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    const c = data.playlistLlmGenresCache;
+    if (!c || typeof c.contentHash !== "string") return null;
+    const byTrackId =
+      typeof c.byTrackId === "object" && c.byTrackId !== null && !Array.isArray(c.byTrackId)
+        ? (c.byTrackId as Record<string, string[]>)
+        : {};
+    return {
+      contentHash: c.contentHash,
+      fetchedAt: typeof c.fetchedAt === "string" ? c.fetchedAt : "",
+      byTrackId
+    };
+  },
+
+  async savePlaylistLlmGenresCache(playlistId: string, cache: PlaylistLlmGenresCache): Promise<void> {
+    await updateDoc(doc(db, "playlists", playlistId), {
+      playlistLlmGenresCache: {
+        contentHash: cache.contentHash,
+        fetchedAt: cache.fetchedAt,
+        byTrackId: cache.byTrackId
+      }
+    });
+  },
   async addTrack(playlistId: string, track: SpotifyTrack): Promise<void> {
-    const enrichedGenres = Array.isArray(track.genres) ? track.genres.filter(Boolean) : [];
+    const withGenres = await spotifyService.enrichTrackWithSpotifyGenres(track);
+    const enrichedGenres = Array.isArray(withGenres.genres) ? withGenres.genres.filter(Boolean) : [];
     const payload: SpotifyTrack = {
-      ...track,
+      ...withGenres,
       genres: enrichedGenres,
-      genresFetchedAt: new Date().toISOString()
+      genresFetchedAt: withGenres.genresFetchedAt ?? new Date().toISOString()
     };
     debugLog(
       "src/services/playlists.ts:addTrack",
@@ -142,8 +182,9 @@ export const playlistService = {
         trackId: track.id,
         incomingGenreCount: Array.isArray(track.genres) ? track.genres.length : 0,
         resolvedGenreCount: enrichedGenres.length,
-        hasReleaseDate: Boolean(track.releaseDate),
-        hasAlbumName: Boolean(track.albumName)
+        spotifyArtistIdCount: withGenres.spotifyArtistIds?.length ?? 0,
+        hasReleaseDate: Boolean(withGenres.releaseDate),
+        hasAlbumName: Boolean(withGenres.albumName)
       },
       "H30"
     );

@@ -481,6 +481,7 @@ function parseJsonBody(req) {
 
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_TRACKS_BATCH_URL = "https://api.spotify.com/v1/tracks";
+const SPOTIFY_ARTISTS_URL = "https://api.spotify.com/v1/artists";
 
 async function fetchSpotifyServerAccessToken() {
   const clientId = process.env.SPOTIFY_CLIENT_ID || "";
@@ -510,7 +511,8 @@ function normalizeSpotifyTrackForClient(item) {
   return {
     id: item.id,
     name: item.name,
-    artists: Array.isArray(item.artists) ? item.artists.map((a) => a.name) : [],
+    artists: Array.isArray(item.artists) ? item.artists.map((a) => a && a.name).filter(Boolean) : [],
+    spotifyArtistIds: Array.isArray(item.artists) ? item.artists.map((a) => a && a.id).filter(Boolean) : [],
     uri: item.uri ?? "",
     albumId: item.album?.id ?? "",
     albumName: item.album?.name ?? "",
@@ -571,6 +573,55 @@ exports.getSpotifyTracksByIds = onRequest({ cors: true, region: "us-central1", i
   }
 });
 
+/** Per-artist GET /v1/artists/{id} on server (same secrets as getSpotifyTracksByIds); genres for playlist enrichment. */
+exports.getSpotifyArtistsByIds = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const body = parseJsonBody(req) || req.body || {};
+    const idsRaw = body.ids;
+    const ids = Array.isArray(idsRaw) ? idsRaw.map((id) => String(id).trim()).filter(Boolean) : [];
+    if (!ids.length) {
+      res.status(400).json({ error: "ids array is required" });
+      return;
+    }
+    const unique = [...new Set(ids)].slice(0, 200);
+    const token = await fetchSpotifyServerAccessToken();
+    const out = [];
+    const chunkSize = 8;
+    for (let i = 0; i < unique.length; i += chunkSize) {
+      const chunk = unique.slice(i, i + chunkSize);
+      const chunkResults = await Promise.all(
+        chunk.map(async (artistId) => {
+          const spotifyRes = await fetch(`${SPOTIFY_ARTISTS_URL}/${encodeURIComponent(artistId)}`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+          });
+          if (!spotifyRes.ok) {
+            const preview = (await spotifyRes.text()).slice(0, 200);
+            logger.warn("getSpotifyArtistsByIds HTTP error", { artistId, status: spotifyRes.status, preview });
+            return null;
+          }
+          const item = await spotifyRes.json();
+          const id = item?.id ? String(item.id) : artistId;
+          const genres = Array.isArray(item?.genres)
+            ? item.genres.map((g) => String(g).trim()).filter(Boolean)
+            : [];
+          return { id, genres };
+        })
+      );
+      for (const row of chunkResults) {
+        if (row) out.push(row);
+      }
+    }
+    res.status(200).json({ artists: out });
+  } catch (error) {
+    logger.error("getSpotifyArtistsByIds failed", error);
+    res.status(500).json({ error: "Internal error", detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 const appspotSa = getAppspotServiceAccount();
 const createSpotifyAuthOptions = {
   cors: true,
@@ -620,28 +671,48 @@ exports.createSpotifyFirebaseSession = onRequest(createSpotifyAuthOptions, async
   }
 });
 
-exports.getSuggestionReason = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
+/** LLM genre labels per track id for playlist analytics; OPENAI_API_KEY on Functions. */
+exports.getPlaylistLlmGenres = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
   try {
     if (req.method !== "POST") {
       res.status(405).json({ error: "Method not allowed" });
       return;
     }
     const token = process.env.OPENAI_API_KEY || "";
-    if (!token) {
-      res.status(200).json({ reason: String(req.body?.baseReason || "").trim() || "Suggested based on co-occurrence with your playlist songs." });
+    const body = parseJsonBody(req) || req.body || {};
+    const tracksRaw = body.tracks;
+    const tracks = Array.isArray(tracksRaw) ? tracksRaw : [];
+    const normalized = tracks
+      .map((t) => ({
+        id: String(t?.id || "").trim(),
+        name: String(t?.name || "").trim(),
+        artists: Array.isArray(t?.artists) ? t.artists.map((a) => String(a || "").trim()).filter(Boolean) : []
+      }))
+      .filter((t) => t.id)
+      .slice(0, 80);
+
+    if (!normalized.length) {
+      res.status(200).json({ byTrackId: {} });
       return;
     }
-    const context = req.body?.context || {};
-    const instruction = String(req.body?.instruction || "Write 1-2 specific sentences explaining why this track fits the playlist.");
-    const baseReason = String(req.body?.baseReason || "").trim();
-    const prompt = [
-      instruction,
-      `Candidate track: ${String(context?.trackName || "Unknown")} by ${(Array.isArray(context?.artists) ? context.artists.join(", ") : "") || "Unknown artist"}.`,
-      `Playlist tracks: ${Array.isArray(context?.playlistTrackNames) ? context.playlistTrackNames.join(", ") : "N/A"}.`,
-      `Seed matches: ${Array.isArray(context?.seedTrackNames) ? context.seedTrackNames.join(", ") : "N/A"}.`,
-      `Score breakdown: ${JSON.stringify(context?.scoreBreakdown || {})}.`,
-      `Base reason: ${baseReason || "N/A"}.`,
-      "Output exactly 1-2 sentences. No bullet points. No markdown."
+    if (!token) {
+      logger.warn("getPlaylistLlmGenres: OPENAI_API_KEY not set");
+      res.status(200).json({ byTrackId: {}, skipped: "no_openai_key" });
+      return;
+    }
+
+    const payloadForModel = normalized.map((t) => ({
+      id: t.id,
+      title: t.name,
+      artists: t.artists.join(", ")
+    }));
+
+    const userPrompt = [
+      "For each song, assign 1 to 4 plausible music genre labels (common English: pop, rock, hip-hop, country, r&b, jazz, electronic, indie, folk, metal, latin, soul, alternative, k-pop, reggae, classical, etc.).",
+      "Respond with JSON only in this exact shape: {\"byTrackId\": { \"<spotify_track_id>\": [\"genre1\", \"genre2\"] } }",
+      "Use lowercase for genres. Include every input id as a key (use [] only if truly unknown).",
+      "Songs (JSON):",
+      JSON.stringify(payloadForModel)
     ].join("\n");
 
     const llmRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -652,23 +723,128 @@ exports.getSuggestionReason = onRequest({ cors: true, region: "us-central1", inv
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.3,
+        temperature: 0.2,
+        response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: "You are a recommendation explanation assistant. Be specific, concise, and factual based only on supplied evidence." },
+          {
+            role: "system",
+            content:
+              "You label songs with mainstream genre tags for playlist analytics. Output valid JSON only; keys must be Spotify track ids from the user message."
+          },
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+
+    if (!llmRes.ok) {
+      const preview = (await llmRes.text()).slice(0, 200);
+      logger.warn("getPlaylistLlmGenres llm HTTP error", { status: llmRes.status, preview });
+      res.status(200).json({ byTrackId: {}, error: "llm_http_error" });
+      return;
+    }
+
+    const llmPayload = await llmRes.json();
+    const content = String(llmPayload?.choices?.[0]?.message?.content || "{}");
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      logger.warn("getPlaylistLlmGenres JSON parse failed", { preview: content.slice(0, 200) });
+      res.status(200).json({ byTrackId: {}, error: "parse_error" });
+      return;
+    }
+
+    const raw = parsed?.byTrackId && typeof parsed.byTrackId === "object" ? parsed.byTrackId : {};
+    const byTrackId = {};
+    for (const t of normalized) {
+      const arr = raw[t.id];
+      byTrackId[t.id] = Array.isArray(arr)
+        ? arr.map((g) => String(g).toLowerCase().trim()).filter(Boolean).slice(0, 8)
+        : [];
+    }
+
+    res.status(200).json({ byTrackId });
+  } catch (error) {
+    logger.error("getPlaylistLlmGenres failed", error);
+    res.status(500).json({ error: "Internal error", detail: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+exports.getSuggestionReason = onRequest({ cors: true, region: "us-central1", invoker: "public" }, async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    const token = process.env.OPENAI_API_KEY || "";
+    const enjoyFallback =
+      "Could be a fun next listen — it sits in a similar pocket to the stuff you’ve already got in this playlist.";
+    if (!token) {
+      res.status(200).json({ reason: enjoyFallback });
+      return;
+    }
+    const context = req.body?.context || {};
+    const instruction = String(
+      req.body?.instruction ||
+        "Write exactly 1–2 short sentences an actual human would enjoy reading in a music app. Focus on why someone might love listening to this suggestion next — mood, energy, artist vibe, or how it fits emotionally with their taste. Be warm and a little playful. Do not mention rankings, scores, statistics, algorithms, co-occurrence, or how the app picked the track."
+    );
+    const artists = Array.isArray(context?.artists) ? context.artists.join(", ") : "";
+    const albumLine =
+      context?.albumName && String(context.albumName).trim()
+        ? `Album: ${String(context.albumName).trim()}.`
+        : "";
+    const playlistSample = Array.isArray(context?.playlistTrackNames)
+      ? context.playlistTrackNames.filter(Boolean).join(", ")
+      : "";
+    const tasteBridge = Array.isArray(context?.seedTrackNames)
+      ? context.seedTrackNames.filter(Boolean).join(", ")
+      : "";
+    const prompt = [
+      instruction,
+      "",
+      "Rules: Plain sentences only — no bullets, no markdown. Do not repeat internal stats or phrases like \"picked because\" or \"genre profile\". Never quote this prompt.",
+      "",
+      `Suggested song: «${String(context?.trackName || "Unknown").trim()}» — ${artists || "Unknown artist"}${albumLine ? ` ${albumLine}` : ""}`.trim(),
+      playlistSample ? `From their playlist (examples of what they already like): ${playlistSample}.` : "",
+      tasteBridge ? `Nearby taste anchors (titles they’ve leaned on): ${tasteBridge}.` : "",
+      "",
+      "Output exactly 1–2 sentences."
+    ]
+      .filter((line) => line !== "")
+      .join("\n");
+
+    const llmRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.48,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You write upbeat blurbs for a music app's \"why try this track\" spot. You're a friend nerding out about songs — never an engineer, analyst, or recommender documenting methodology."
+          },
           { role: "user", content: prompt }
         ]
       })
     });
     if (!llmRes.ok) {
       logger.warn("getSuggestionReason llm call failed", { status: llmRes.status });
-      res.status(200).json({ reason: baseReason || "Suggested based on co-occurrence with your playlist songs." });
+      res.status(200).json({ reason: enjoyFallback });
       return;
     }
     const payload = await llmRes.json();
     const content = String(payload?.choices?.[0]?.message?.content || "").trim();
-    res.status(200).json({ reason: content || baseReason || "Suggested based on co-occurrence with your playlist songs." });
+    res.status(200).json({ reason: content || enjoyFallback });
   } catch (error) {
     logger.error("getSuggestionReason failed", error);
-    res.status(200).json({ reason: String(req.body?.baseReason || "").trim() || "Suggested based on co-occurrence with your playlist songs." });
+    res.status(200).json({
+      reason:
+        "Could be a fun next listen — it sits in a similar pocket to the stuff you’ve already got in this playlist."
+    });
   }
 });

@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:spotify-genres": "node scripts/verifySpotifyArtistGenres.mjs",
     "test:watch": "vitest",
     "seed:fetch-spotify": "node --loader ts-node/esm scripts/spotify/fetchSpotifyCatalog.ts",
     "seed:generate": "node --loader ts-node/esm scripts/seedSyntheticData.ts",

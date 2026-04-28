@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { PlaylistOverviewDashboard } from "../components/PlaylistOverviewDashboard";
 import { SongDetailsDrawer } from "../components/SongDetailsDrawer";
 import { useAuth } from "../context/AuthContext";
 import { geniusService } from "../services/genius";
 import { computePlaylistAnalytics } from "../services/playlistAnalytics";
 import { playbackController } from "../services/playback";
-import { playlistService } from "../services/playlists";
+import { ensurePlaylistLlmGenres } from "../services/playlistLlmGenres";
+import { computePlaylistTrackContentHash, playlistService } from "../services/playlists";
 import { recommendationService } from "../services/recommendations";
 import type { GeniusEnrichment, PlaylistTrack, RecommendationItem, SpotifyTrack } from "../types/music";
 import { formatDuration } from "../lib/format";
@@ -56,6 +58,30 @@ export function PlaylistPage() {
       setAddedFromSuggestions([]);
     }
   }, [playlistId, suppressionStorageKey, addedFromSuggestionStorageKey]);
+
+  const trackContentHash = useMemo(() => computePlaylistTrackContentHash(tracks.map((t) => t.id)), [tracks]);
+
+  useEffect(() => {
+    if (!playlistId || loading || !hasLoadedOnce || !tracks.length) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await ensurePlaylistLlmGenres(playlistId, tracks);
+        if (cancelled || !result?.byTrackId) return;
+        setTracks((prev) =>
+          prev.map((t) => ({
+            ...t,
+            llmGenres: result.byTrackId[t.id] ?? []
+          }))
+        );
+      } catch {
+        /* LLM optional */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [playlistId, loading, hasLoadedOnce, trackContentHash]);
 
   useEffect(() => {
     if (!recommendations.length) return;
@@ -201,7 +227,10 @@ export function PlaylistPage() {
           .filter(Boolean)
       )
     );
-    return Array.from(new Set(["all", ...fromAnalytics, ...fromGeniusTags]));
+    const fromLlm = Array.from(
+      new Set(tracks.flatMap((track) => track.llmGenres ?? []).map((g) => g.toLowerCase().trim()).filter(Boolean))
+    );
+    return Array.from(new Set(["all", ...fromAnalytics, ...fromGeniusTags, ...fromLlm]));
   }, [analytics.genreComposition, tracks]);
 
   function handleTrackClick(track: PlaylistTrack) {
@@ -481,7 +510,7 @@ export function PlaylistPage() {
     if (activeGenreFilter !== "all") {
       const target = activeGenreFilter.toLowerCase();
       next = next.filter((track) => {
-        const trackGenres = (track.genres ?? []).map((genre) => genre.toLowerCase());
+        const trackGenres = [...(track.genres ?? []), ...(track.llmGenres ?? [])].map((g) => g.toLowerCase());
         const trackTags = (track.genius?.tags ?? []).map((tag) => tag.toLowerCase());
         return trackGenres.includes(target) || trackTags.includes(target);
       });
@@ -509,12 +538,8 @@ export function PlaylistPage() {
       {loading ? <p>Loading playlist...</p> : null}
 
       <h3>Overview</h3>
-      <div className="page-section" style={{ marginTop: 8 }}>
-        <p style={{ margin: "0 0 8px" }}>Total duration: {formatDuration(analytics.totalDurationMs)}</p>
-        <p style={{ margin: "0 0 8px" }}>
-          Decades: {Object.entries(analytics.decadeBreakdown).map(([d, c]) => `${d} (${c})`).join(", ") || "None"}
-        </p>
-        <p style={{ margin: 0 }}>Genres: {Object.entries(analytics.genreComposition).map(([g, c]) => `${g} (${c})`).join(", ") || "None"}</p>
+      <div className="page-section playlist-overview-section">
+        <PlaylistOverviewDashboard analytics={analytics} trackCount={tracks.length} />
       </div>
 
       <div className="filters">
