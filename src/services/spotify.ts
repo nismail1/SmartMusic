@@ -211,22 +211,6 @@ function normalizeTag(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/** Merge unique genres from up to three primary artists; Spotify returns low-cased display strings. */
-function mergeGenresForTrack(artistIds: string[] | undefined, artistGenres: Map<string, string[]>): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const aid of (artistIds ?? []).slice(0, 3)) {
-    for (const g of artistGenres.get(aid) ?? []) {
-      const key = g.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(g);
-      if (out.length >= 25) return out;
-    }
-  }
-  return out;
-}
-
 /** `GET /v1/artists/{id}` — batch `?ids=` was removed (Spotify Web API Feb 2026). Exported for tests. */
 export function spotifyArtistDetailUrl(artistId: string): string {
   const id = artistId.trim();
@@ -260,6 +244,8 @@ function logDevArtistGenreSummary(
     genresPreview: genres.slice(0, 6)
   }));
   const totalTags = [...map.values()].reduce((acc, g) => acc + g.length, 0);
+  // Spotify currently often omits genres entirely; avoid noisy repeated logs with zero useful tags.
+  if (totalTags === 0) return;
   // perArtist: genreCount 0 = Spotify returned genres: [] for that artist (or missing row).
   console.info(`[SmartMusic] Spotify artist genres (${source})`, {
     path:
@@ -273,113 +259,9 @@ function logDevArtistGenreSummary(
   });
 }
 
-/** One request per artist id (`GET /v1/artists/{id}`); replaces removed batch `GET /v1/artists?ids=`. */
-async function getArtistGenresBySpotifyIds(artistIds: string[]): Promise<Map<string, string[]>> {
-  const unique = [...new Set(artistIds.map((id) => id.trim()).filter(Boolean))].slice(0, 200);
-  const out = new Map<string, string[]>();
-  if (!unique.length) return out;
-
-  const proxyUrl = resolveSpotifyArtistsProxyUrl();
-  if (proxyUrl) {
-    try {
-      const response = await fetch(proxyUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: unique })
-      });
-      if (response.ok) {
-        const payload = (await response.json()) as { artists?: Array<{ id?: string; genres?: string[] }> };
-        for (const a of payload.artists ?? []) {
-          if (a?.id) {
-            out.set(
-              String(a.id),
-              Array.isArray(a.genres) ? a.genres.map((g) => String(g).trim()).filter(Boolean) : []
-            );
-          }
-        }
-        debugLog(
-          "src/services/spotify.ts:getArtistGenresBySpotifyIds",
-          "artist genres via server proxy",
-          {
-            requestedCount: unique.length,
-            resolvedCount: out.size,
-            proxyHost: (() => {
-              try {
-                return new URL(proxyUrl).host;
-              } catch {
-                return "";
-              }
-            })()
-          },
-          "H-artist-proxy"
-        );
-        logDevArtistGenreSummary("proxy", unique, out);
-        return out;
-      }
-      let preview = "";
-      try {
-        preview = (await response.text()).slice(0, 200);
-      } catch {
-        /* ignore */
-      }
-      debugLog(
-        "src/services/spotify.ts:getArtistGenresBySpotifyIds",
-        "artist genres proxy failed; falling back to browser token",
-        { status: response.status, preview },
-        "H-artist-proxy"
-      );
-    } catch (err) {
-      debugLog(
-        "src/services/spotify.ts:getArtistGenresBySpotifyIds",
-        "artist genres proxy threw; falling back to browser token",
-        { message: err instanceof Error ? err.message : String(err) },
-        "H-artist-proxy"
-      );
-    }
-  }
-
-  const token = await getToken();
-  for (let i = 0; i < unique.length; i += ARTIST_DETAIL_CONCURRENCY) {
-    const batch = unique.slice(i, i + ARTIST_DETAIL_CONCURRENCY);
-    const settled = await Promise.allSettled(
-      batch.map(async (artistId) => {
-        const url = spotifyArtistDetailUrl(artistId);
-        const res = await fetchWithSpotifyRetry(url, token);
-        if (!res.ok) return;
-        const json: unknown = await res.json();
-        const { id, genres } = parseSpotifyArtistDetailJson(json, artistId);
-        out.set(id, genres);
-      })
-    );
-    for (const r of settled) {
-      if (r.status === "rejected") {
-        debugLog(
-          "src/services/spotify.ts:getArtistGenresBySpotifyIds",
-          "single artist request rejected",
-          { message: r.reason instanceof Error ? r.reason.message : String(r.reason) },
-          "H-artist-detail"
-        );
-      }
-    }
-  }
-  logDevArtistGenreSummary("browser", unique, out);
-  return out;
-}
-
-/** When playlist/normalized track has no `spotifyArtistIds`, resolve from a single-track Web API read. */
-async function resolveSpotifyArtistIdsForTrack(track: SpotifyTrack): Promise<string[]> {
-  if (track.spotifyArtistIds?.length) return track.spotifyArtistIds;
-  if (!track.id) return [];
-  const token = await getToken();
-  const market = spotifyCatalogMarket();
-  const res = await fetchWithSpotifyRetry(
-    `${SPOTIFY_TRACKS_URL}/${encodeURIComponent(track.id)}?${new URLSearchParams({ market }).toString()}`,
-    token
-  );
-  if (!res.ok) return [];
-  const item: { artists?: Array<{ id?: string }> } = await res.json();
-  return Array.isArray(item?.artists) ? item.artists.map((a) => (a?.id ? String(a.id) : "")).filter(Boolean) : [];
-}
+void ARTIST_DETAIL_CONCURRENCY;
+void resolveSpotifyArtistsProxyUrl;
+void logDevArtistGenreSummary;
 
 export const spotifyService = {
   async searchTracks(
@@ -1108,51 +990,18 @@ export const spotifyService = {
   },
 
   /**
-   * Load genres from Spotify artist objects (not from tracks; not from Genius).
-   * No-op if `track.genres` is already non-empty.
+   * Genre enrichment is OpenAI-driven now; avoid Spotify artist-genre endpoint churn.
+   * Keep any already-present genres and do not call /artists for genre hydration.
    */
   async enrichTrackWithSpotifyGenres(track: SpotifyTrack): Promise<SpotifyTrack> {
     if (track.genres && track.genres.length > 0) return track;
-    let ids = track.spotifyArtistIds?.length ? [...track.spotifyArtistIds] : await resolveSpotifyArtistIdsForTrack(track);
-    if (!ids.length) return { ...track, genres: track.genres ?? [] };
-    const map = await getArtistGenresBySpotifyIds(ids.slice(0, 3));
-    return {
-      ...track,
-      spotifyArtistIds: track.spotifyArtistIds?.length ? track.spotifyArtistIds : ids,
-      genres: mergeGenresForTrack(ids, map),
-      genresFetchedAt: new Date().toISOString()
-    };
+    return { ...track, genres: track.genres ?? [] };
   },
 
   /**
-   * Batched artist genre fetch for many tracks (e.g. Spotify import). Deduplicates artist API calls.
+   * Genre enrichment is OpenAI-driven now; do not call Spotify artist genre endpoints here.
    */
   async enrichTracksBatchedForGenres(tracks: SpotifyTrack[]): Promise<SpotifyTrack[]> {
-    if (!tracks.length) return [];
-    const work = tracks.map((t) => ({ ...t }));
-    const needIds = work.filter((t) => !t.spotifyArtistIds?.length && t.id);
-    if (needIds.length) {
-      const batch = await this.getTracksByIds([...new Set(needIds.map((t) => t.id))]);
-      const byId = new Map(batch.map((h) => [h.id, h]));
-      for (const t of work) {
-        const h = byId.get(t.id);
-        if (h?.spotifyArtistIds?.length) t.spotifyArtistIds = h.spotifyArtistIds;
-      }
-    }
-    const allArtist = new Set<string>();
-    for (const t of work) {
-      for (const id of (t.spotifyArtistIds ?? []).slice(0, 2)) {
-        allArtist.add(id);
-      }
-    }
-    const map = await getArtistGenresBySpotifyIds([...allArtist]);
-    return work.map((t) => {
-      if (t.genres && t.genres.length > 0) return t;
-      return {
-        ...t,
-        genres: mergeGenresForTrack(t.spotifyArtistIds, map),
-        genresFetchedAt: new Date().toISOString()
-      };
-    });
+    return tracks.map((t) => ({ ...t, genres: t.genres ?? [] }));
   }
 };

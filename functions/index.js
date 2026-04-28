@@ -139,115 +139,193 @@ exports.getRecommendations = onRequest({ cors: true, region: "us-central1", invo
       res.status(405).json({ error: "Method not allowed" });
       return;
     }
-    const { playlistId } = req.body || {};
+    const body = parseJsonBody(req) || req.body || {};
+    const playlistId = String(body.playlistId || "").trim();
+    const excludedSongIds = Array.isArray(body.excludeSongIds)
+      ? body.excludeSongIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
     if (!playlistId) {
       res.status(400).json({ error: "playlistId is required" });
       return;
     }
 
     const tracksSnap = await db.collection("playlists").doc(playlistId).collection("tracks").get();
-    const playlistTrackIds = new Set(tracksSnap.docs.map((doc) => doc.id));
+    const playlistTracks = tracksSnap.docs.map((docSnap) => {
+      const data = docSnap.data() || {};
+      return {
+        id: String(data.id || docSnap.id),
+        name: String(data.name || ""),
+        artists: Array.isArray(data.artists) ? data.artists.map((a) => String(a || "")).filter(Boolean) : [],
+        genres: Array.isArray(data.genres) ? data.genres.map((g) => String(g || "").toLowerCase().trim()).filter(Boolean) : []
+      };
+    });
+    const excludedSet = new Set([...playlistTracks.map((t) => t.id), ...excludedSongIds]);
+    logger.info("getRecommendations input summary", {
+      playlistId,
+      playlistTrackCount: playlistTracks.length,
+      excludedSongCount: excludedSongIds.length,
+      nonEmptyGenreTrackCount: playlistTracks.filter((t) => Array.isArray(t.genres) && t.genres.length > 0).length
+    });
 
-    if (playlistTrackIds.size === 0) {
-      const coldItems = await buildColdItems(5);
-      res.json({ items: coldItems });
+    if (playlistTracks.length === 0) {
+      res.json({ items: [] });
+      return;
+    }
+    const openAiToken = process.env.OPENAI_API_KEY || "";
+    if (!openAiToken) {
+      logger.warn("getRecommendations skipped: OPENAI_API_KEY missing");
+      res.json({ items: [] });
       return;
     }
 
-    const playlistRaw = new Map();
-    const searchRaw = new Map();
+    const spotifyToken = await fetchSpotifyServerAccessToken();
+    const market = "US";
+    const normalize = (value) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const playlistGenres = [...new Set(playlistTracks.flatMap((t) => t.genres || []).filter(Boolean))].slice(0, 8);
+    const vibeHints = playlistGenres.length ? playlistGenres : ["indie", "folk", "acoustic", "singer-songwriter"];
 
-    for (const trackId of playlistTrackIds) {
-      const [playlistCoDoc, searchCoDoc] = await Promise.all([
-        db.collection("cooccurrence_playlist").doc(trackId).get(),
-        db.collection("cooccurrence_search").doc(trackId).get()
-      ]);
+    const modelPrompt = [
+      "Suggest songs that listeners who enjoy these playlist tracks would plausibly add next.",
+      "Use broad music knowledge: artist/genre similarity, era, mood, and common playlist fit.",
+      "Return ONLY JSON: {\"candidates\":[{\"title\":\"...\",\"artist\":\"...\",\"why\":\"...\"}]}",
+      "Rules:",
+      "- 15 candidates.",
+      "- Avoid songs already in the playlist.",
+      "- Favor tracks likely available on Spotify.",
+      "- Keep \"why\" to one short sentence.",
+      "",
+      `Playlist tracks: ${playlistTracks.map((t) => `${t.name} — ${t.artists.join(", ")}`).slice(0, 20).join(" | ")}`,
+      `Genre/vibe hints: ${vibeHints.join(", ")}`
+    ].join("\n");
 
-      const playlistNeighbors = playlistCoDoc.exists ? playlistCoDoc.data().neighbors || {} : {};
-      const searchNeighbors = searchCoDoc.exists ? searchCoDoc.data().neighbors || {} : {};
-
-      Object.entries(playlistNeighbors).forEach(([candidateId, rawValue]) => {
-        if (playlistTrackIds.has(candidateId)) return;
-        const next = (playlistRaw.get(candidateId) || 0) + Number(rawValue || 0);
-        playlistRaw.set(candidateId, next);
-      });
-
-      Object.entries(searchNeighbors).forEach(([candidateId, rawValue]) => {
-        if (playlistTrackIds.has(candidateId)) return;
-        const next = (searchRaw.get(candidateId) || 0) + Number(rawValue || 0);
-        searchRaw.set(candidateId, next);
-      });
-    }
-
-    const playlistScores = normalizeMap(playlistRaw);
-    const searchScores = normalizeMap(searchRaw);
-    const candidateIds = Array.from(new Set([...playlistScores.keys(), ...searchScores.keys()])).slice(0, 80);
-
-    if (candidateIds.length === 0) {
-      const coldItems = await buildColdItems(5);
-      res.json({ items: coldItems });
-      return;
-    }
-
-    const scoredItems = await Promise.all(
-      candidateIds.map(async (candidateId) => {
-        const [statsSnap, songSnap] = await Promise.all([
-          db.collection("song_stats").doc(candidateId).get(),
-          db.collection("songs").doc(candidateId).get()
-        ]);
-        const stats = statsSnap.exists ? statsSnap.data() : {};
-        const song = songSnap.exists ? songSnap.data() : {};
-
-        const globalEngagement = computePopularSafeScore(stats);
-        const playlistSimilarity = playlistScores.get(candidateId) || 0;
-        const searchSimilarity = searchScores.get(candidateId) || 0;
-        const recencyAffinity = playlistSimilarity * 0.8 + searchSimilarity * 0.2;
-        const baseScore = scoreCandidate({ playlistSimilarity, searchSimilarity, globalEngagement, recencyAffinity });
-        const score = baseScore;
-        const hasUsefulSignal =
-          playlistSimilarity >= 0.05 || searchSimilarity >= 0.05 || globalEngagement >= 0.1;
-        if (!hasUsefulSignal) return null;
-
-        return {
-          songId: candidateId,
-          songName: song?.name || candidateId,
-          artists: song?.artists || [],
-          score,
-          reasons: buildReasons({
-            playlistSimilarity,
-            searchSimilarity,
-            globalEngagement,
-            isTopUp: false
-          })
-        };
+    const llmRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openAiToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.5,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a music curator. Produce plausible song recommendations in strict JSON only."
+          },
+          { role: "user", content: modelPrompt }
+        ]
       })
-    );
+    });
 
-    const dedupedRanked = scoredItems
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
-    const chosen = dedupedRanked.slice(0, 5);
-
-    if (chosen.length < 5) {
-      const chosenIds = new Set(chosen.map((item) => item.songId));
-      const needed = 5 - chosen.length;
-      const topUpItems = (await buildColdItems(30))
-        .filter((item) => !playlistTrackIds.has(item.songId) && !chosenIds.has(item.songId))
-        .slice(0, needed)
-        .map((item) => ({
-          ...item,
-          reasons: buildReasons({
-            playlistSimilarity: 0,
-            searchSimilarity: 0,
-            globalEngagement: item.score,
-            isTopUp: true
-          })
-        }));
-      chosen.push(...topUpItems);
+    if (!llmRes.ok) {
+      logger.warn("getRecommendations openai HTTP error", { status: llmRes.status });
+      res.json({ items: [] });
+      return;
     }
 
-    const items = chosen.slice(0, 5);
-    res.json({ items });
+    const llmPayload = await llmRes.json();
+    const content = String(llmPayload?.choices?.[0]?.message?.content || "{}");
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      parsed = { candidates: [] };
+    }
+    const llmCandidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+    logger.info("getRecommendations llm candidates parsed", {
+      playlistId,
+      candidateCount: llmCandidates.length
+    });
+
+    const resolutionStats = {
+      llmCandidateCount: llmCandidates.length,
+      rejectedMissingTitleOrArtist: 0,
+      spotifySearchHttpFailures: 0,
+      spotifySearchEmptyResults: 0,
+      rejectedExcludedOrDuplicate: 0,
+      accepted: 0
+    };
+    async function resolveCandidate(candidate, rankIndex) {
+      const title = String(candidate?.title || "").trim();
+      const artist = String(candidate?.artist || "").trim();
+      const why = String(candidate?.why || "").trim();
+      if (!title || !artist) {
+        resolutionStats.rejectedMissingTitleOrArtist += 1;
+        return null;
+      }
+      const searchUrl = `${SPOTIFY_SEARCH_URL}?${new URLSearchParams({
+        q: `track:${title} artist:${artist}`,
+        type: "track",
+        market,
+        limit: "5"
+      }).toString()}`;
+      const spotifyRes = await fetch(searchUrl, {
+        headers: { Authorization: `Bearer ${spotifyToken}`, Accept: "application/json" }
+      });
+      if (!spotifyRes.ok) {
+        resolutionStats.spotifySearchHttpFailures += 1;
+        return null;
+      }
+      const payload = await spotifyRes.json();
+      const results = Array.isArray(payload?.tracks?.items) ? payload.tracks.items : [];
+      if (!results.length) {
+        resolutionStats.spotifySearchEmptyResults += 1;
+        return null;
+      }
+      const picked =
+        results.find((track) => {
+          const nName = normalize(track?.name);
+          const nArtist = normalize((track?.artists || []).map((a) => a?.name).join(" "));
+          return nName.includes(normalize(title)) && nArtist.includes(normalize(artist));
+        }) || results[0];
+      if (!picked?.id || excludedSet.has(String(picked.id))) {
+        resolutionStats.rejectedExcludedOrDuplicate += 1;
+        return null;
+      }
+      excludedSet.add(String(picked.id));
+      resolutionStats.accepted += 1;
+      return {
+        songId: String(picked.id),
+        songName: String(picked.name || title),
+        artists: Array.isArray(picked.artists) ? picked.artists.map((a) => String(a?.name || "")).filter(Boolean) : [artist],
+        score: Math.max(0.1, 1 - rankIndex * 0.04),
+        reasons: [why || "Could be a great fit with your playlist's mood and style."]
+      };
+    }
+
+    const resolved = [];
+    for (let i = 0; i < llmCandidates.length && resolved.length < 5; i++) {
+      const row = await resolveCandidate(llmCandidates[i], i);
+      if (row) resolved.push(row);
+    }
+
+    const items = resolved.slice(0, 5);
+    logger.info("getRecommendations output summary", {
+      playlistId,
+      returnedCount: items.length,
+      ...resolutionStats
+    });
+    if (items.length === 0) {
+      logger.warn("getRecommendations returned no items", {
+        playlistId,
+        ...resolutionStats
+      });
+    }
+    res.json({
+      items,
+      debug: {
+        source: "openai+spotify-verified",
+        playlistTrackCount: playlistTracks.length,
+        ...resolutionStats
+      }
+    });
   } catch (error) {
     logger.error("getRecommendations failed", error);
     res.status(500).json({ error: "Internal recommendation error" });
@@ -482,6 +560,7 @@ function parseJsonBody(req) {
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_TRACKS_BATCH_URL = "https://api.spotify.com/v1/tracks";
 const SPOTIFY_ARTISTS_URL = "https://api.spotify.com/v1/artists";
+const SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search";
 
 async function fetchSpotifyServerAccessToken() {
   const clientId = process.env.SPOTIFY_CLIENT_ID || "";

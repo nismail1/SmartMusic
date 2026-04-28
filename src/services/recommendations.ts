@@ -10,6 +10,7 @@ import {
   limit
 } from "firebase/firestore";
 import { db } from "./firebase";
+import { ensurePlaylistLlmGenres, resolvePlaylistLlmGenresEndpoint } from "./playlistLlmGenres";
 import { spotifyService, type SpotifyPublicPlaylist } from "./spotify";
 
 interface NeighborDoc {
@@ -149,6 +150,67 @@ function computeGenreMatch(track: { genres?: string[] }, profile: Map<string, nu
     if (profile.has(normalizeText(genre))) hits += 1;
   }
   return total ? hits / total : 0;
+}
+
+/** One batched OpenAI genre pass for tracks missing Spotify genres. */
+async function inferLlmGenresForTracks(
+  tracks: Array<Pick<SpotifyTrack, "id" | "name" | "artists" | "genres">>,
+  hypothesisId: string
+): Promise<Map<string, string[]>> {
+  const endpoint = resolvePlaylistLlmGenresEndpoint();
+  if (!endpoint) return new Map();
+  const missing = tracks.filter((t) => t.id && (!Array.isArray(t.genres) || t.genres.length === 0));
+  if (!missing.length) return new Map();
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tracks: missing.map((t) => ({
+          id: t.id,
+          name: t.name,
+          artists: t.artists ?? []
+        }))
+      })
+    });
+    if (!response.ok) {
+      debugLog(
+        "src/services/recommendations.ts:inferLlmGenresForTracks",
+        "LLM genre endpoint failed for candidate tracks",
+        { status: response.status, requestedCount: missing.length },
+        hypothesisId,
+        "metadata-genre-debug"
+      );
+      return new Map();
+    }
+    const payload = (await response.json()) as { byTrackId?: Record<string, string[]> };
+    const raw = payload?.byTrackId ?? {};
+    const out = new Map<string, string[]>();
+    for (const track of missing) {
+      const arr = raw[track.id];
+      const normalized = Array.isArray(arr)
+        ? arr.map((g) => String(g).toLowerCase().trim()).filter(Boolean).slice(0, 8)
+        : [];
+      if (normalized.length) out.set(track.id, normalized);
+    }
+    debugLog(
+      "src/services/recommendations.ts:inferLlmGenresForTracks",
+      "LLM genre endpoint completed for candidate tracks",
+      { requestedCount: missing.length, resolvedCount: out.size },
+      hypothesisId,
+      "metadata-genre-debug"
+    );
+    return out;
+  } catch (error) {
+    debugLog(
+      "src/services/recommendations.ts:inferLlmGenresForTracks",
+      "LLM genre endpoint threw for candidate tracks",
+      { message: error instanceof Error ? error.message : String(error) },
+      hypothesisId,
+      "metadata-genre-debug"
+    );
+    return new Map();
+  }
 }
 
 function buildReason(
@@ -639,6 +701,19 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
       addedAt: String(data.addedAt ?? new Date().toISOString())
     } as PlaylistTrack;
   });
+  try {
+    const cachedLlm = await ensurePlaylistLlmGenres(playlistId, playlistTracks);
+    if (cachedLlm?.byTrackId) {
+      for (const t of playlistTracks) {
+        const inferred = Array.isArray(cachedLlm.byTrackId[t.id]) ? cachedLlm.byTrackId[t.id] : [];
+        if (!inferred.length) continue;
+        const merged = [...new Set([...(t.genres ?? []), ...inferred])];
+        t.genres = merged;
+      }
+    }
+  } catch {
+    /* optional enrichment */
+  }
   const playlistTrackIds = playlistTracks.map((track) => track.id).filter(Boolean);
   const excludedIds = new Set(playlistTrackIds);
   for (const excludedSongId of options?.excludeSongIds ?? []) {
@@ -719,7 +794,14 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
 
   const candidateIds = candidates.map(([id]) => id);
   const spotifyTracks = await spotifyService.getTracksByIds(candidateIds.slice(0, 50));
-  const trackById = new Map(spotifyTracks.map((track) => [track.id, track]));
+  const llmByTrackId = await inferLlmGenresForTracks(spotifyTracks, "H-llm-candidate");
+  const trackById = new Map(
+    spotifyTracks.map((track) => {
+      const inferred = llmByTrackId.get(track.id) ?? [];
+      const mergedGenres = [...new Set([...(track.genres ?? []), ...inferred])];
+      return [track.id, { ...track, genres: mergedGenres }];
+    })
+  );
   const genreProfile = computeGenreProfile(seedTracks);
   const maxCooccur = Math.max(1, ...candidates.map(([, count]) => count));
   const maxCoverage = Math.max(1, ...Array.from(seedCoverage.values(), (value) => value));
@@ -845,6 +927,9 @@ async function buildCooccurrenceRecommendations(playlistId: string, options?: Re
   return finalSuggestions;
 }
 
+// Intentionally retained for local diagnostics/experiments, but not used in production flow.
+void buildCooccurrenceRecommendations;
+
 export const recommendationService = {
   async getRecommendations(playlistId: string, options?: RecommendationOptions): Promise<RecommendationItem[]> {
     const requestKey = `${playlistId}|${(options?.excludeSongIds ?? []).slice().sort().join(",")}|${options?.forceRefresh ? "force" : "normal"}`;
@@ -873,37 +958,49 @@ export const recommendationService = {
           response = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ playlistId })
+            body: JSON.stringify({ playlistId, excludeSongIds: Array.from(excludedIds) })
           });
         } catch {
           debugLog(
             "src/services/recommendations.ts:getRecommendations",
-            "api call failed, switching to fallback builder",
+            "api call failed; returning empty suggestions",
             { playlistId },
             "H12",
             "suppression-debug"
           );
-          return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+          return [];
         }
         if (!response.ok) {
           debugLog(
             "src/services/recommendations.ts:getRecommendations",
-            "api response not ok, switching to fallback builder",
+            "api response not ok; returning empty suggestions",
             { status: response.status, playlistId },
             "H12",
             "suppression-debug"
           );
-          return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+          return [];
         }
-        const payload = (await response.json()) as { suggestions?: RecommendationItem[]; items?: RecommendationItem[] };
+        const payload = (await response.json()) as {
+          suggestions?: RecommendationItem[];
+          items?: RecommendationItem[];
+          debug?: Record<string, unknown>;
+        };
         const fromApi = payload.suggestions ?? payload.items ?? [];
         const filteredFromApi = fromApi.filter((item) => !excludedIds.has(item.songId));
+        if (import.meta.env.DEV && filteredFromApi.length === 0) {
+          console.info("[SmartMusic] Suggestions empty from endpoint", {
+            playlistId,
+            endpoint,
+            debug: payload.debug ?? null
+          });
+        }
         debugLog(
           "src/services/recommendations.ts:getRecommendations",
           "api recommendations payload",
           {
             endpoint,
             count: filteredFromApi.length,
+            debug: payload.debug ?? null,
             sample: filteredFromApi[0]
               ? {
                   songId: filteredFromApi[0].songId,
@@ -918,24 +1015,16 @@ export const recommendationService = {
         if (filteredFromApi.length >= RETURN_SUGGESTIONS) {
           return hydrateApiRecommendationsFromSpotify(playlistId, filteredFromApi, options);
         }
-        const fallback = await buildCooccurrenceRecommendations(playlistId, options);
-        const filteredFallback = fallback.filter((item) => !excludedIds.has(item.songId));
         debugLog(
           "src/services/recommendations.ts:getRecommendations",
-          "combined api+fallback result computed",
-          {
-            hydratedCount: filteredFromApi.length,
-            fallbackCount: filteredFallback.length,
-            returnCount: [...filteredFromApi, ...filteredFallback.filter((item) => !filteredFromApi.some((existing) => existing.songId === item.songId))]
-              .slice(0, RETURN_SUGGESTIONS).length
-          },
+          "api returned fewer than required suggestions",
+          { hydratedCount: filteredFromApi.length, requiredCount: RETURN_SUGGESTIONS },
           "H13",
           "suppression-debug"
         );
-        return [...filteredFromApi, ...filteredFallback.filter((item) => !filteredFromApi.some((existing) => existing.songId === item.songId))]
-          .slice(0, RETURN_SUGGESTIONS);
+        return filteredFromApi.slice(0, RETURN_SUGGESTIONS);
       }
-      return (await buildCooccurrenceRecommendations(playlistId, options)).slice(0, RETURN_SUGGESTIONS);
+      return [];
     } catch (error) {
       debugLog(
         "src/services/recommendations.ts:getRecommendations",
