@@ -77,6 +77,20 @@ async function persistGeniusMetadata(songId: string, enrichment: GeniusEnrichmen
     { merge: true }
   );
 }
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/\(.*?\)/g, '') 
+    .replace(/\[.*?\]/g, '') 
+    .replace(/feat\.?.*/gi, '')
+    .replace(/ft\.?.*/gi, '')
+    .replace(/featuring.*/gi, '')
+    .replace(/remaster(ed)?/gi, '')
+    .replace(/\bradio edit\b.*$/gi, '')
+    .replace(/live/gi, '')
+    .replace(/[^\w\s]/g, '')
+    .trim();
+}
 
 export const geniusService = {
   async enrichTrack(track: SpotifyTrack): Promise<GeniusEnrichment> {
@@ -98,18 +112,24 @@ export const geniusService = {
     } catch {}
 
     if (resolvedProxyEndpoint) {
+
+    console.log("payload", track.name, track.artists);
+    let normalizedTrackName = normalizeTitle(track.name);
+    
       try {
         const proxyResponse = await fetch(resolvedProxyEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            trackName: track.name,
+            trackName: normalizedTrackName,
             artistName: track.artists[0] ?? "",
             token
           })
         });
+
         if (proxyResponse.ok) {
           const proxyPayload = (await proxyResponse.json()) as Partial<GeniusEnrichment>;
+          console.log("proxyPayload", proxyPayload);
           const enrichment: GeniusEnrichment = {
             songDescription: proxyPayload.songDescription ?? null,
             artistDescription: proxyPayload.artistDescription ?? null,
