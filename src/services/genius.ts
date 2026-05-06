@@ -115,6 +115,7 @@ export const geniusService = {
 
     console.log("payload", track.name, track.artists);
     let normalizedTrackName = normalizeTitle(track.name);
+    
       try {
         const proxyResponse = await fetch(resolvedProxyEndpoint, {
           method: "POST",
